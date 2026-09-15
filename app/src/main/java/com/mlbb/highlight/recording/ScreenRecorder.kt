@@ -18,7 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ScreenRecorder(
     context: Context,
     private val width: Int,
-    private val height: Int
+    private val height: Int,
+    outputFile: File? = null
 ) {
     private val appContext = context.applicationContext
     private val bufferInfo = MediaCodec.BufferInfo()
@@ -27,8 +28,10 @@ class ScreenRecorder(
     private val encoder: MediaCodec = MediaCodec.createEncoderByType(MIME_TYPE)
     private val muxer: MediaMuxer
     private val drainThread: Thread
+    private val outputPath: File = outputFile ?: createOutputFile()
 
     val outputFile: File
+        get() = outputPath
     val inputSurface: Surface
 
     @Volatile
@@ -36,8 +39,6 @@ class ScreenRecorder(
     private var trackIndex = -1
 
     init {
-        outputFile = createOutputFile()
-
         val format = MediaFormat.createVideoFormat(MIME_TYPE, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, estimateBitrate(width, height))
@@ -47,7 +48,7 @@ class ScreenRecorder(
 
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = encoder.createInputSurface()
-        muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        muxer = MediaMuxer(outputPath.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
         encoder.start()
 
         drainThread = Thread(::drainEncoder, "ScreenRecorderDrain").also { it.start() }

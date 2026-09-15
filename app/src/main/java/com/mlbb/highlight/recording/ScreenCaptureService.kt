@@ -16,29 +16,47 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.MediaStore
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.mlbb.highlight.MainActivity
 import com.mlbb.highlight.R
+import com.mlbb.highlight.highlight.ClipBuilder
+import com.mlbb.highlight.highlight.ManualHighlightService
 import java.io.File
 
 class ScreenCaptureService : Service() {
+    private lateinit var segmentDirectory: File
+    private lateinit var replayBuffer: ReplayBuffer
+    private lateinit var segmentManager: SegmentManager
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var screenRecorder: ScreenRecorder? = null
     private var isReleasing = false
+    private var recordingSize: RecordingSize? = null
+    private val segmentRotationHandler = Handler(Looper.getMainLooper())
+    private var segmentRotationRunnable: Runnable? = null
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            releaseCapture(stopProjection = false)
-            stopSelf()
+            releaseCapture(stopProjection = false, shouldStopSelf = false)
+            isCapturing = false
+            sendCaptureStatus()
         }
     }
 
     override fun onCreate() {
         super.onCreate()
+        segmentDirectory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Segments")
+        replayBuffer = ReplayBuffer(maxDurationMs = 30_000L, segmentDurationMs = 5_000L)
+        segmentManager = SegmentManager(
+            baseDirectory = segmentDirectory,
+            segmentDurationMs = 5_000L,
+            replayBuffer = replayBuffer
+        )
         createNotificationChannel()
     }
 
@@ -67,7 +85,9 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        releaseCapture(stopProjection = true)
+        if (!isReleasing) {
+            releaseCapture(stopProjection = false, shouldStopSelf = false)
+        }
         super.onDestroy()
     }
 
@@ -102,14 +122,33 @@ class ScreenCaptureService : Service() {
         val width = bounds.width().coerceAtLeast(1)
         val height = bounds.height().coerceAtLeast(1)
         val densityDpi = resources.displayMetrics.densityDpi
-        val recordingSize = calculateRecordingSize(width, height)
-        val recorder = ScreenRecorder(this, recordingSize.width, recordingSize.height)
+        val size = calculateRecordingSize(width, height)
+        recordingSize = size
+
+        startSegmentCapture(projection, size, densityDpi)
+        scheduleSegmentRotation()
+    }
+
+    private fun startSegmentCapture(projection: MediaProjection, size: RecordingSize, densityDpi: Int) {
+        val previousDisplay = virtualDisplay
+        if (previousDisplay != null) {
+            previousDisplay.release()
+        }
+
+        val previousRecorder = screenRecorder
+        if (previousRecorder != null) {
+            saveFinalRecordingSegment(previousRecorder)
+        }
+
+        segmentDirectory.mkdirs()
+        val segmentFile = segmentManager.createSegmentFile()
+        val recorder = ScreenRecorder(this, size.width, size.height, segmentFile)
         screenRecorder = recorder
 
         virtualDisplay = projection.createVirtualDisplay(
             VIRTUAL_DISPLAY_NAME,
-            recordingSize.width,
-            recordingSize.height,
+            size.width,
+            size.height,
             densityDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             recorder.inputSurface,
@@ -118,9 +157,27 @@ class ScreenCaptureService : Service() {
         )
     }
 
-    private fun releaseCapture(stopProjection: Boolean) {
+    private fun scheduleSegmentRotation() {
+        segmentRotationRunnable?.let { segmentRotationHandler.removeCallbacks(it) }
+        segmentRotationRunnable = object : Runnable {
+            override fun run() {
+                if (!isCapturing || mediaProjection == null) return
+                val projection = mediaProjection ?: return
+                val size = recordingSize ?: return
+                val densityDpi = resources.displayMetrics.densityDpi
+                startSegmentCapture(projection, size, densityDpi)
+                scheduleSegmentRotation()
+            }
+        }
+        segmentRotationHandler.postDelayed(segmentRotationRunnable!!, 5_000L)
+    }
+
+    private fun releaseCapture(stopProjection: Boolean, shouldStopSelf: Boolean = true) {
         if (isReleasing) return
         isReleasing = true
+
+        segmentRotationRunnable?.let { segmentRotationHandler.removeCallbacks(it) }
+        segmentRotationRunnable = null
 
         isCapturing = false
         sendCaptureStatus()
@@ -139,18 +196,27 @@ class ScreenCaptureService : Service() {
         screenRecorder = null
 
         Thread {
-            val recordingFile = recorder?.stop()
-            if (recordingFile != null && recordingFile.length() > 0L) {
-                val recordingUri = publishRecording(recordingFile)
-                sendCaptureStatus(recordingFile, recordingUri)
-                if (recordingUri != null) {
-                    showRecordingSavedNotification(recordingUri, recordingFile.name)
-                }
+            if (recorder != null) {
+                saveFinalRecordingSegment(recorder)
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
             isReleasing = false
-            stopSelf()
+            if (shouldStopSelf) {
+                stopSelf()
+            }
         }.start()
+    }
+
+    private fun saveFinalRecordingSegment(recorder: ScreenRecorder?) {
+        val recordingFile = recorder?.stop() ?: return
+        if (!recordingFile.exists() || recordingFile.length() <= 0L) return
+
+        segmentManager.registerSegment(recordingFile)
+        val recordingUri = publishRecording(recordingFile)
+        sendCaptureStatus(recordingFile, recordingUri)
+        if (recordingUri != null) {
+            showRecordingSavedNotification(recordingUri, recordingFile.name)
+        }
     }
 
     private fun calculateRecordingSize(screenWidth: Int, screenHeight: Int): RecordingSize {
@@ -301,6 +367,10 @@ class ScreenCaptureService : Service() {
         var isCapturing: Boolean = false
             private set
 
+        fun setCapturing(value: Boolean) {
+            isCapturing = value
+        }
+
         fun startIntent(context: Context, resultCode: Int, resultData: Intent): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_START
@@ -313,6 +383,25 @@ class ScreenCaptureService : Service() {
             return Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_STOP
             }
+        }
+
+        fun createManualHighlight(context: Context): File? {
+            val segmentDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Segments")
+            val highlightDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Highlights")
+            if (!segmentDir.exists()) return null
+
+            val segments = segmentDir.listFiles { file -> file.isFile && file.extension.equals("mp4", true) }
+                ?.sortedBy { it.lastModified() }
+                ?.map { file -> SegmentFile(file = file, createdAtMs = file.lastModified(), durationMs = 5_000L) }
+                ?: return null
+
+            if (segments.isEmpty()) return null
+
+            val outputFile = ClipBuilder(highlightDir).buildFromSegments(
+                segments,
+                "highlight_${System.currentTimeMillis()}.mp4"
+            )
+            return outputFile
         }
     }
 

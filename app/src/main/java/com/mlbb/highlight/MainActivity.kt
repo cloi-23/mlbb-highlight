@@ -36,6 +36,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.mlbb.highlight.recording.ScreenCaptureService
+import com.mlbb.highlight.storage.HighlightRepository
+import com.mlbb.highlight.storage.HighlightEntity
+import com.mlbb.highlight.ui.HighlightsScreen
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,7 +47,9 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
+                    val highlightRepository = remember { HighlightRepository(applicationContext) }
                     var isCapturing by rememberSaveable { mutableStateOf(ScreenCaptureService.isCapturing) }
+                    var hasValidCapture by rememberSaveable { mutableStateOf(false) }
                     var statusMessage by rememberSaveable {
                         mutableStateOf(
                             if (ScreenCaptureService.isCapturing) {
@@ -56,6 +61,13 @@ class MainActivity : ComponentActivity() {
                     }
                     var shouldStartAfterNotificationPermission by rememberSaveable {
                         mutableStateOf(false)
+                    }
+                    var highlights by remember { mutableStateOf(highlightRepository.listHighlights()) }
+
+                    fun refreshCaptureUiState() {
+                        isCapturing = ScreenCaptureService.isCapturing
+                        hasValidCapture = highlights.isNotEmpty()
+                        statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
                     }
 
                     val projectionManager = remember {
@@ -92,8 +104,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     LaunchedEffect(Unit) {
-                        isCapturing = ScreenCaptureService.isCapturing
-                        statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
+                        refreshCaptureUiState()
                     }
 
                     DisposableEffect(Unit) {
@@ -105,6 +116,9 @@ class MainActivity : ComponentActivity() {
                                     ScreenCaptureService.EXTRA_IS_CAPTURING,
                                     false
                                 )
+                                if (!isCapturing) {
+                                    ScreenCaptureService.setCapturing(false)
+                                }
                                 statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
                             }
                         }
@@ -150,6 +164,7 @@ class MainActivity : ComponentActivity() {
                         Button(
                             enabled = isCapturing,
                             onClick = {
+                                ScreenCaptureService.setCapturing(false)
                                 startService(ScreenCaptureService.stopIntent(this@MainActivity))
                                 isCapturing = false
                                 statusMessage = "Capture stopped"
@@ -157,6 +172,52 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Text("Stop Capture")
                         }
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Button(
+                            enabled = isCapturing || hasValidCapture,
+                            onClick = {
+                                val highlightFile = ScreenCaptureService.createManualHighlight(this@MainActivity)
+                                val savedEntity = if (highlightFile != null) highlightRepository.saveHighlight(highlightFile) else null
+                                highlights = highlightRepository.listHighlights()
+                                hasValidCapture = highlights.isNotEmpty()
+                                statusMessage = if (savedEntity != null) {
+                                    "Highlight saved: ${savedEntity.title}"
+                                } else {
+                                    "No capture available to highlight"
+                                }
+                            }
+                        ) {
+                            Text("Save Highlight")
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HighlightsScreen(
+                            highlights = highlights,
+                            onPlay = { entity ->
+                                val file = java.io.File(entity.filePath)
+                                if (!file.exists() || !file.isFile || file.length() <= 0L) {
+                                    statusMessage = "Highlight file is missing or empty"
+                                    return@HighlightsScreen
+                                }
+                                val intent = Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(android.net.Uri.fromFile(file), "video/mp4")
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                startActivity(intent)
+                            },
+                            onDelete = { entity ->
+                                highlightRepository.deleteHighlight(entity)
+                                highlights = highlightRepository.listHighlights()
+                            },
+                            onShare = { entity ->
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "video/mp4"
+                                    putExtra(Intent.EXTRA_STREAM, android.net.Uri.fromFile(java.io.File(entity.filePath)))
+                                    putExtra(Intent.EXTRA_SUBJECT, entity.title)
+                                }
+                                startActivity(Intent.createChooser(shareIntent, "Share highlight"))
+                            }
+                        )
                     }
                 }
             }
