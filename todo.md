@@ -2,27 +2,28 @@
 
 ## Phase 1: Capture and replay buffer
 
-- [ ] Verify Android screen capture permissions and foreground service requirements
-- [ ] Set up a foreground recording service using MediaProjection
-- [ ] Implement a screen capture encoder and write short video segments
-- [ ] Maintain a rolling 30-second replay buffer with segment cleanup
+- [x] Verify Android screen capture permissions and foreground service requirements
+- [x] Set up a foreground recording service using MediaProjection
+- [x] Implement a screen capture encoder and write short video segments
+- [x] Maintain a rolling 30-second replay buffer with segment cleanup
 - [ ] Make buffer duration configurable in settings
-- [ ] Ensure the app keeps only the newest replay footage in memory/storage
+- [x] Ensure the app keeps only the newest replay footage in memory/storage
 
 ## Phase 2: Manual highlight flow
 
+- [x] Add an in-app manual highlight trigger button
+- [x] On trigger, keep previous 20 seconds and record next 10 seconds
+- [x] Combine the selected clip into one final MP4
+- [x] Save highlight video as a timestamped file in local storage
+- [x] Show saved highlights in the app UI
 - [ ] Add a floating/overlay highlight trigger button
-- [ ] On trigger, keep previous 20 seconds and record next 10 seconds
-- [ ] Combine the selected clip into one final MP4
-- [ ] Save highlight video as a timestamped file in local storage
-- [ ] Show saved highlights in the app UI
 
 ## Phase 3: Highlight management
 
-- [ ] Add play support for saved highlight videos
-- [ ] Add delete support for saved highlight videos
-- [ ] Add share support for saved highlight videos
-- [ ] Guard against overlapping highlight requests during recording
+- [x] Add play support for saved highlight videos
+- [x] Add delete support for saved highlight videos
+- [x] Add share support for saved highlight videos
+- [x] Guard against overlapping highlight requests during recording
 
 ## Phase 4: App polish
 
@@ -43,10 +44,11 @@
 
 - [x] Capture permissions and foreground service setup are in place for the app shell
 - [x] Recording flow is stable enough to keep the capture service alive
-- [x] Manual highlight save path exists and copies the latest segment to a Highlights folder
-- [ ] Full rolling 30-second replay buffer with true segment rotation is still the main next milestone
-- [ ] Real 20s-before + 10s-after highlight timing and MP4 merge are still pending
-- [ ] Play/delete/share highlight management is still pending
+- [x] Segment rotation feeds a rolling replay buffer and removes expired segment files
+- [x] Manual highlight requests now wait for post-event footage and merge selected segments
+- [x] Play/delete/share highlight management is wired through FileProvider URIs
+- [ ] Buffer length and highlight timing are still hard-coded and need settings support
+- [ ] Segment-level clips are working toward the MVP; exact frame-level trimming is still pending
 - [ ] OCR / AI detection is intentionally deferred until the non-AI MVP works reliably
 
 ## Notes

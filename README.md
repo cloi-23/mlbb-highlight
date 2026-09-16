@@ -8,19 +8,22 @@ The current MVP can:
 
 - Request Android screen-capture permission.
 - Start and stop foreground screen recording.
-- Encode recordings as MP4 using `MediaCodec` and `MediaMuxer`.
-- Save completed recordings to the public Movies folder.
-- Open the saved recording from the system notification.
+- Encode screen capture as short MP4 segments using `MediaCodec` and `MediaMuxer`.
+- Maintain an internal rolling segment buffer for replay capture.
+- Save a manual highlight request with previous replay footage plus post-event footage.
+- Show saved highlights in the app with play, delete, and share actions.
 
-Replay-buffer capture, manual highlight clipping, and automatic event detection are planned next.
+Automatic event detection is intentionally deferred until the manual replay MVP is reliable.
 
 ## Output Location
 
-Recordings are saved on the device at:
+Highlight files are saved in the app's external files area:
 
 ```text
-Internal storage/Movies/MLBBHighlight/
+Android/data/com.mlbb.highlight/files/Highlights/
 ```
+
+Temporary replay segments are stored under the app's external Movies files area and are rotated out by the replay buffer.
 
 ## Requirements
 
@@ -50,8 +53,9 @@ app/build/outputs/apk/debug/app-debug.apk
 2. Connect an Android device or start an emulator.
 3. Install and launch the debug app.
 4. Tap **Start Capture** and approve screen recording permission.
-5. Tap **Stop Capture** when finished.
-6. Tap the **Recording saved** notification to play the video.
+5. Tap **Save Highlight** while capture is running.
+6. Wait for the post-event recording window to finish.
+7. Play, delete, or share the saved highlight from the list.
 
 ## Architecture
 
@@ -60,13 +64,12 @@ app/build/outputs/apk/debug/app-debug.apk
 - Android MediaProjection
 - Foreground service
 - MediaCodec and MediaMuxer
-- MediaStore for public video storage
+- FileProvider for local highlight playback and sharing
 
 ## Roadmap
 
-- Segment-based rolling replay buffer
-- Manual highlight button with pre-event and post-event footage
-- Highlights list with playback, sharing, and deletion
+- Configurable buffer and highlight durations
+- More exact MP4 trimming inside segment boundaries
 - OCR-based event detection
 - MLBB-specific computer-vision event classification
 

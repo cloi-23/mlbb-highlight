@@ -35,10 +35,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import com.mlbb.highlight.recording.ScreenCaptureService
 import com.mlbb.highlight.storage.HighlightRepository
-import com.mlbb.highlight.storage.HighlightEntity
 import com.mlbb.highlight.ui.HighlightsScreen
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,7 +50,7 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     val highlightRepository = remember { HighlightRepository(applicationContext) }
                     var isCapturing by rememberSaveable { mutableStateOf(ScreenCaptureService.isCapturing) }
-                    var hasValidCapture by rememberSaveable { mutableStateOf(false) }
+                    var recordingSeconds by rememberSaveable { mutableStateOf(0) }
                     var statusMessage by rememberSaveable {
                         mutableStateOf(
                             if (ScreenCaptureService.isCapturing) {
@@ -66,7 +67,6 @@ class MainActivity : ComponentActivity() {
 
                     fun refreshCaptureUiState() {
                         isCapturing = ScreenCaptureService.isCapturing
-                        hasValidCapture = highlights.isNotEmpty()
                         statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
                     }
 
@@ -88,8 +88,10 @@ class MainActivity : ComponentActivity() {
                             )
                             isCapturing = true
                             statusMessage = "Capture running"
+                            recordingSeconds = 0
                         } else {
                             isCapturing = false
+                            recordingSeconds = 0
                             statusMessage = "Capture permission denied"
                         }
                     }
@@ -107,26 +109,52 @@ class MainActivity : ComponentActivity() {
                         refreshCaptureUiState()
                     }
 
+                    LaunchedEffect(isCapturing) {
+                        while (isCapturing) {
+                            delay(1_000L)
+                            recordingSeconds += 1
+                        }
+                    }
+
                     DisposableEffect(Unit) {
                         val receiver = object : BroadcastReceiver() {
                             override fun onReceive(context: Context?, intent: Intent?) {
-                                if (intent?.action != ScreenCaptureService.ACTION_STATUS_CHANGED) return
+                                when (intent?.action) {
+                                    ScreenCaptureService.ACTION_STATUS_CHANGED -> {
+                                        val wasCapturing = isCapturing
+                                        isCapturing = intent.getBooleanExtra(
+                                            ScreenCaptureService.EXTRA_IS_CAPTURING,
+                                            false
+                                        )
+                                        if (isCapturing && !wasCapturing) {
+                                            recordingSeconds = 0
+                                        }
+                                        if (!isCapturing) {
+                                            ScreenCaptureService.setCapturing(false)
+                                            recordingSeconds = 0
+                                        }
+                                        statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
+                                    }
 
-                                isCapturing = intent.getBooleanExtra(
-                                    ScreenCaptureService.EXTRA_IS_CAPTURING,
-                                    false
-                                )
-                                if (!isCapturing) {
-                                    ScreenCaptureService.setCapturing(false)
+                                    ScreenCaptureService.ACTION_HIGHLIGHT_STATUS_CHANGED -> {
+                                        statusMessage = intent.getStringExtra(
+                                            ScreenCaptureService.EXTRA_HIGHLIGHT_MESSAGE
+                                        ) ?: statusMessage
+                                        highlights = highlightRepository.listHighlights()
+                                    }
                                 }
-                                statusMessage = if (isCapturing) "Capture running" else "Capture stopped"
                             }
+                        }
+
+                        val filter = IntentFilter().apply {
+                            addAction(ScreenCaptureService.ACTION_STATUS_CHANGED)
+                            addAction(ScreenCaptureService.ACTION_HIGHLIGHT_STATUS_CHANGED)
                         }
 
                         ContextCompat.registerReceiver(
                             this@MainActivity,
                             receiver,
-                            IntentFilter(ScreenCaptureService.ACTION_STATUS_CHANGED),
+                            filter,
                             ContextCompat.RECEIVER_NOT_EXPORTED
                         )
 
@@ -146,6 +174,14 @@ class MainActivity : ComponentActivity() {
                         Text("Screen Capture MVP")
                         Spacer(modifier = Modifier.height(32.dp))
                         Text("Status: $statusMessage")
+                        if (isCapturing) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = formatElapsed(recordingSeconds),
+                                style = MaterialTheme.typography.displayLarge
+                            )
+                            Text("Recording elapsed")
+                        }
                         Spacer(modifier = Modifier.height(24.dp))
                         Button(
                             enabled = !isCapturing,
@@ -167,6 +203,7 @@ class MainActivity : ComponentActivity() {
                                 ScreenCaptureService.setCapturing(false)
                                 startService(ScreenCaptureService.stopIntent(this@MainActivity))
                                 isCapturing = false
+                                recordingSeconds = 0
                                 statusMessage = "Capture stopped"
                             }
                         ) {
@@ -174,17 +211,10 @@ class MainActivity : ComponentActivity() {
                         }
                         Spacer(modifier = Modifier.height(12.dp))
                         Button(
-                            enabled = isCapturing || hasValidCapture,
+                            enabled = isCapturing,
                             onClick = {
-                                val highlightFile = ScreenCaptureService.createManualHighlight(this@MainActivity)
-                                val savedEntity = if (highlightFile != null) highlightRepository.saveHighlight(highlightFile) else null
-                                highlights = highlightRepository.listHighlights()
-                                hasValidCapture = highlights.isNotEmpty()
-                                statusMessage = if (savedEntity != null) {
-                                    "Highlight saved: ${savedEntity.title}"
-                                } else {
-                                    "No capture available to highlight"
-                                }
+                                startService(ScreenCaptureService.manualHighlightIntent(this@MainActivity))
+                                statusMessage = "Highlight requested"
                             }
                         ) {
                             Text("Save Highlight")
@@ -199,8 +229,13 @@ class MainActivity : ComponentActivity() {
                                     statusMessage = "Highlight file is missing or empty"
                                     return@HighlightsScreen
                                 }
+                                val uri = FileProvider.getUriForFile(
+                                    this@MainActivity,
+                                    "$packageName.fileprovider",
+                                    file
+                                )
                                 val intent = Intent(Intent.ACTION_VIEW).apply {
-                                    setDataAndType(android.net.Uri.fromFile(file), "video/mp4")
+                                    setDataAndType(uri, "video/mp4")
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
                                 startActivity(intent)
@@ -210,10 +245,16 @@ class MainActivity : ComponentActivity() {
                                 highlights = highlightRepository.listHighlights()
                             },
                             onShare = { entity ->
+                                val uri = FileProvider.getUriForFile(
+                                    this@MainActivity,
+                                    "$packageName.fileprovider",
+                                    java.io.File(entity.filePath)
+                                )
                                 val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                     type = "video/mp4"
-                                    putExtra(Intent.EXTRA_STREAM, android.net.Uri.fromFile(java.io.File(entity.filePath)))
+                                    putExtra(Intent.EXTRA_STREAM, uri)
                                     putExtra(Intent.EXTRA_SUBJECT, entity.title)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
                                 startActivity(Intent.createChooser(shareIntent, "Share highlight"))
                             }
@@ -227,5 +268,11 @@ class MainActivity : ComponentActivity() {
     private fun shouldRequestNotificationPermission(): Boolean {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun formatElapsed(seconds: Int): String {
+        val minutes = seconds / 60
+        val remainingSeconds = seconds % 60
+        return "%02d:%02d".format(minutes, remainingSeconds)
     }
 }
