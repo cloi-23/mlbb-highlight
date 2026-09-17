@@ -14,8 +14,8 @@ class HighlightManager(
     fun createManualHighlight(triggerTimeMs: Long): HighlightResult {
         val request = HighlightRequest(
             triggerTimeMs = triggerTimeMs,
-            preEventDurationMs = 20_000L,
-            postEventDurationMs = 10_000L
+            preEventDurationMs = 10_000L,
+            postEventDurationMs = 2_000L
         )
 
         val selectedSegments = replayBuffer.getSegmentsForWindow(
