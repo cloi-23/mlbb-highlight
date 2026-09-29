@@ -6,7 +6,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -19,26 +18,30 @@ import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.provider.MediaStore
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.mlbb.highlight.MainActivity
 import com.mlbb.highlight.R
 import com.mlbb.highlight.highlight.ClipBuilder
-import com.mlbb.highlight.highlight.ManualHighlightService
+import com.mlbb.highlight.highlight.HighlightRequest
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenCaptureService : Service() {
     private lateinit var segmentDirectory: File
+    private lateinit var highlightDirectory: File
     private lateinit var replayBuffer: ReplayBuffer
     private lateinit var segmentManager: SegmentManager
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var screenRecorder: ScreenRecorder? = null
+    private var currentSegmentStartedAtMs: Long = 0L
     private var isReleasing = false
     private var recordingSize: RecordingSize? = null
     private val segmentRotationHandler = Handler(Looper.getMainLooper())
     private var segmentRotationRunnable: Runnable? = null
+    private val highlightInProgress = AtomicBoolean(false)
+    private val protectedSegmentPaths = mutableSetOf<String>()
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -51,10 +54,19 @@ class ScreenCaptureService : Service() {
     override fun onCreate() {
         super.onCreate()
         segmentDirectory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Segments")
-        replayBuffer = ReplayBuffer(maxDurationMs = 30_000L, segmentDurationMs = 5_000L)
+        highlightDirectory = File(getExternalFilesDir(null), "Highlights")
+        replayBuffer = ReplayBuffer(
+            maxDurationMs = REPLAY_BUFFER_DURATION_MS,
+            segmentDurationMs = SEGMENT_DURATION_MS,
+            onSegmentRemoved = { segment ->
+                if (segment.file.exists() && !isSegmentProtected(segment.file)) {
+                    segment.file.delete()
+                }
+            }
+        )
         segmentManager = SegmentManager(
             baseDirectory = segmentDirectory,
-            segmentDurationMs = 5_000L,
+            segmentDurationMs = SEGMENT_DURATION_MS,
             replayBuffer = replayBuffer
         )
         createNotificationChannel()
@@ -78,6 +90,10 @@ class ScreenCaptureService : Service() {
             ACTION_STOP -> {
                 releaseCapture(stopProjection = true)
                 stopSelf()
+            }
+
+            ACTION_MANUAL_HIGHLIGHT -> {
+                requestManualHighlight()
             }
         }
 
@@ -126,7 +142,6 @@ class ScreenCaptureService : Service() {
         recordingSize = size
 
         startSegmentCapture(projection, size, densityDpi)
-        scheduleSegmentRotation()
     }
 
     private fun startSegmentCapture(projection: MediaProjection, size: RecordingSize, densityDpi: Int) {
@@ -143,6 +158,7 @@ class ScreenCaptureService : Service() {
         segmentDirectory.mkdirs()
         val segmentFile = segmentManager.createSegmentFile()
         val recorder = ScreenRecorder(this, size.width, size.height, segmentFile)
+        currentSegmentStartedAtMs = System.currentTimeMillis()
         screenRecorder = recorder
 
         virtualDisplay = projection.createVirtualDisplay(
@@ -158,18 +174,11 @@ class ScreenCaptureService : Service() {
     }
 
     private fun scheduleSegmentRotation() {
+        // Android 14+ does not allow repeatedly creating VirtualDisplay instances from
+        // the same MediaProjection consent token. Keep this disabled until segmenting is
+        // moved behind a single stable capture surface.
         segmentRotationRunnable?.let { segmentRotationHandler.removeCallbacks(it) }
-        segmentRotationRunnable = object : Runnable {
-            override fun run() {
-                if (!isCapturing || mediaProjection == null) return
-                val projection = mediaProjection ?: return
-                val size = recordingSize ?: return
-                val densityDpi = resources.displayMetrics.densityDpi
-                startSegmentCapture(projection, size, densityDpi)
-                scheduleSegmentRotation()
-            }
-        }
-        segmentRotationHandler.postDelayed(segmentRotationRunnable!!, 5_000L)
+        segmentRotationRunnable = null
     }
 
     private fun releaseCapture(stopProjection: Boolean, shouldStopSelf: Boolean = true) {
@@ -197,7 +206,7 @@ class ScreenCaptureService : Service() {
 
         Thread {
             if (recorder != null) {
-                saveFinalRecordingSegment(recorder)
+                saveFinalRecordingSegment(recorder, currentSegmentStartedAtMs)
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
             isReleasing = false
@@ -207,15 +216,122 @@ class ScreenCaptureService : Service() {
         }.start()
     }
 
-    private fun saveFinalRecordingSegment(recorder: ScreenRecorder?) {
+    private fun saveFinalRecordingSegment(recorder: ScreenRecorder?, startedAtMs: Long = currentSegmentStartedAtMs) {
         val recordingFile = recorder?.stop() ?: return
         if (!recordingFile.exists() || recordingFile.length() <= 0L) return
 
-        segmentManager.registerSegment(recordingFile)
-        val recordingUri = publishRecording(recordingFile)
-        sendCaptureStatus(recordingFile, recordingUri)
-        if (recordingUri != null) {
-            showRecordingSavedNotification(recordingUri, recordingFile.name)
+        segmentManager.registerSegment(recordingFile, startedAtMs)
+        sendCaptureStatus(recordingFile = recordingFile)
+    }
+
+    private fun requestManualHighlight() {
+        if (!isCapturing || mediaProjection == null) {
+            sendHighlightStatus("Start capture before saving a highlight")
+            return
+        }
+
+        if (!highlightInProgress.compareAndSet(false, true)) {
+            sendHighlightStatus("Highlight already in progress")
+            return
+        }
+
+        val request = HighlightRequest(triggerTimeMs = System.currentTimeMillis())
+        val preEventSegments = replayBuffer.getSegmentsForWindow(request.startTimeMs, request.triggerTimeMs)
+        protectSegments(preEventSegments)
+        sendHighlightStatus("Saving highlight: 10s before + 2s after")
+        segmentRotationHandler.postDelayed(
+            {
+                finalizeManualHighlight(request, preEventSegments)
+            },
+            request.postEventDurationMs
+        )
+    }
+
+    private fun finalizeManualHighlight(request: HighlightRequest, preEventSegments: List<SegmentFile>) {
+        val projection = mediaProjection
+        val recorder = screenRecorder
+        val activeSegmentStartedAtMs = currentSegmentStartedAtMs
+        if (!isCapturing || projection == null || recorder == null) {
+            unprotectSegments(preEventSegments)
+            highlightInProgress.set(false)
+            sendHighlightStatus("Capture stopped before highlight was ready")
+            return
+        }
+
+        virtualDisplay?.release()
+        virtualDisplay = null
+        screenRecorder = null
+        mediaProjection = null
+        isCapturing = false
+        sendCaptureStatus()
+
+        runCatching { projection.unregisterCallback(projectionCallback) }
+        runCatching { projection.stop() }
+
+        Thread {
+            try {
+                val recordingFile = recorder.stop()
+                val activeSegment = if (recordingFile.exists() && recordingFile.length() > 0L) {
+                    segmentManager.registerSegment(
+                        file = recordingFile,
+                        startedAtMs = activeSegmentStartedAtMs,
+                        finishedAtMs = System.currentTimeMillis()
+                    )
+                } else {
+                    null
+                }
+
+                val selectedSegments = (
+                    preEventSegments +
+                        listOfNotNull(activeSegment) +
+                        replayBuffer.getSegmentsForWindow(request.triggerTimeMs, request.endTimeMs)
+                    ).distinctBy { it.file.absolutePath }
+
+                if (selectedSegments.isEmpty()) {
+                    sendHighlightStatus("No replay footage available for highlight")
+                    return@Thread
+                }
+
+                val outputFile = ClipBuilder(highlightDirectory).buildWindowFromSegments(
+                    selectedSegments,
+                    "highlight_${request.timestampName()}.mp4",
+                    request.startTimeMs,
+                    request.endTimeMs
+                )
+                sendHighlightStatus("Highlight saved. Capture stopped.", outputFile)
+                showHighlightSavedNotification(outputFile)
+            } catch (error: Exception) {
+                sendHighlightStatus("Highlight failed: ${error.message ?: "unknown error"}")
+            } finally {
+                unprotectSegments(preEventSegments)
+                highlightInProgress.set(false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }.start()
+    }
+
+    private fun protectSegments(segments: List<SegmentFile>) {
+        synchronized(protectedSegmentPaths) {
+            segments.forEach { protectedSegmentPaths.add(it.file.absolutePath) }
+        }
+    }
+
+    private fun unprotectSegments(segments: List<SegmentFile>) {
+        val currentPaths = replayBuffer.currentSegments().mapTo(mutableSetOf()) { it.file.absolutePath }
+        synchronized(protectedSegmentPaths) {
+            segments.forEach { segment ->
+                protectedSegmentPaths.remove(segment.file.absolutePath)
+                if (segment.file.absolutePath !in currentPaths && segment.file.exists()) {
+                    segment.file.delete()
+                }
+            }
+        }
+    }
+
+    private fun isSegmentProtected(file: File): Boolean {
+        return synchronized(protectedSegmentPaths) {
+            file.absolutePath in protectedSegmentPaths
         }
     }
 
@@ -231,61 +347,6 @@ class ScreenCaptureService : Service() {
         return if (value % 2 == 0) value else value - 1
     }
 
-    private fun publishRecording(recordingFile: File): android.net.Uri? {
-        val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, recordingFile.name)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/$OUTPUT_DIRECTORY")
-            put(MediaStore.Video.Media.IS_PENDING, 1)
-        }
-
-        val resolver = contentResolver
-        val recordingUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-            ?: return null
-
-        return runCatching {
-            resolver.openOutputStream(recordingUri)?.use { output ->
-                recordingFile.inputStream().use { input -> input.copyTo(output) }
-            } ?: error("Unable to open published recording")
-
-            resolver.update(
-                recordingUri,
-                ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) },
-                null,
-                null
-            )
-            recordingUri
-        }.getOrElse {
-            resolver.delete(recordingUri, null, null)
-            null
-        }
-    }
-
-    private fun showRecordingSavedNotification(recordingUri: android.net.Uri, recordingName: String) {
-        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(recordingUri, "video/mp4")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_screen_capture)
-            .setContentTitle("Recording saved")
-            .setContentText(recordingName)
-            .setContentIntent(
-                PendingIntent.getActivity(
-                    this,
-                    2,
-                    viewIntent,
-                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                )
-            )
-            .setAutoCancel(true)
-            .setOnlyAlertOnce(true)
-            .build()
-
-        getSystemService(NotificationManager::class.java).notify(RECORDING_SAVED_NOTIFICATION_ID, notification)
-    }
-
     private fun sendCaptureStatus(recordingFile: File? = null, recordingUri: android.net.Uri? = null) {
         sendBroadcast(
             Intent(ACTION_STATUS_CHANGED)
@@ -294,6 +355,46 @@ class ScreenCaptureService : Service() {
                 .putExtra(EXTRA_RECORDING_URI, recordingUri?.toString())
                 .putExtra(EXTRA_RECORDING_PATH, recordingFile?.absolutePath)
         )
+    }
+
+    private fun sendHighlightStatus(message: String, highlightFile: File? = null) {
+        sendBroadcast(
+            Intent(ACTION_HIGHLIGHT_STATUS_CHANGED)
+                .setPackage(packageName)
+                .putExtra(EXTRA_HIGHLIGHT_MESSAGE, message)
+                .putExtra(EXTRA_HIGHLIGHT_PATH, highlightFile?.absolutePath)
+                .putExtra(EXTRA_IS_HIGHLIGHT_IN_PROGRESS, highlightInProgress.get())
+        )
+    }
+
+    private fun showHighlightSavedNotification(highlightFile: File) {
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            highlightFile
+        )
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "video/mp4")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_screen_capture)
+            .setContentTitle("Highlight saved")
+            .setContentText(highlightFile.name)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this,
+                    3,
+                    viewIntent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
+            .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
+            .build()
+
+        getSystemService(NotificationManager::class.java).notify(HIGHLIGHT_SAVED_NOTIFICATION_ID, notification)
     }
 
     private fun startForegroundForProjection() {
@@ -349,19 +450,25 @@ class ScreenCaptureService : Service() {
     companion object {
         private const val CHANNEL_ID = "screen_capture"
         private const val NOTIFICATION_ID = 1001
-        private const val RECORDING_SAVED_NOTIFICATION_ID = 1002
+        private const val HIGHLIGHT_SAVED_NOTIFICATION_ID = 1003
         private const val VIRTUAL_DISPLAY_NAME = "MLBBHighlightCapture"
         private const val MAX_RECORDING_LONG_EDGE = 1280
-        private const val OUTPUT_DIRECTORY = "MLBBHighlight"
+        private const val SEGMENT_DURATION_MS = 5_000L
+        private const val REPLAY_BUFFER_DURATION_MS = 30_000L
         private const val EXTRA_RESULT_CODE = "extra_result_code"
         private const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_IS_CAPTURING = "extra_is_capturing"
         const val EXTRA_RECORDING_URI = "extra_recording_uri"
         const val EXTRA_RECORDING_PATH = "extra_recording_path"
+        const val EXTRA_HIGHLIGHT_PATH = "extra_highlight_path"
+        const val EXTRA_HIGHLIGHT_MESSAGE = "extra_highlight_message"
+        const val EXTRA_IS_HIGHLIGHT_IN_PROGRESS = "extra_is_highlight_in_progress"
 
         const val ACTION_START = "com.mlbb.highlight.recording.action.START"
         const val ACTION_STOP = "com.mlbb.highlight.recording.action.STOP"
+        const val ACTION_MANUAL_HIGHLIGHT = "com.mlbb.highlight.recording.action.MANUAL_HIGHLIGHT"
         const val ACTION_STATUS_CHANGED = "com.mlbb.highlight.recording.action.STATUS_CHANGED"
+        const val ACTION_HIGHLIGHT_STATUS_CHANGED = "com.mlbb.highlight.recording.action.HIGHLIGHT_STATUS_CHANGED"
 
         @Volatile
         var isCapturing: Boolean = false
@@ -385,23 +492,10 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        fun createManualHighlight(context: Context): File? {
-            val segmentDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Segments")
-            val highlightDir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Highlights")
-            if (!segmentDir.exists()) return null
-
-            val segments = segmentDir.listFiles { file -> file.isFile && file.extension.equals("mp4", true) }
-                ?.sortedBy { it.lastModified() }
-                ?.map { file -> SegmentFile(file = file, createdAtMs = file.lastModified(), durationMs = 5_000L) }
-                ?: return null
-
-            if (segments.isEmpty()) return null
-
-            val outputFile = ClipBuilder(highlightDir).buildFromSegments(
-                segments,
-                "highlight_${System.currentTimeMillis()}.mp4"
-            )
-            return outputFile
+        fun manualHighlightIntent(context: Context): Intent {
+            return Intent(context, ScreenCaptureService::class.java).apply {
+                action = ACTION_MANUAL_HIGHLIGHT
+            }
         }
     }
 

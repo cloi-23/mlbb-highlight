@@ -13,8 +13,8 @@ class ManualHighlightService(
     private val clipBuilder = ClipBuilder(outputDirectory)
 
     fun createHighlight(triggerTimeMs: Long): HighlightResult {
-        val preEventDurationMs = 20_000L
-        val postEventDurationMs = 10_000L
+        val preEventDurationMs = 10_000L
+        val postEventDurationMs = 2_000L
         val startMs = triggerTimeMs - preEventDurationMs
         val endMs = triggerTimeMs + postEventDurationMs
 

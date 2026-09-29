@@ -18,12 +18,15 @@ class SegmentManager(
         return File(baseDirectory, "segment_$timestamp.mp4")
     }
 
-    fun registerSegment(file: File): SegmentFile {
-        val createdAtMs = System.currentTimeMillis()
+    fun registerSegment(
+        file: File,
+        startedAtMs: Long,
+        finishedAtMs: Long = System.currentTimeMillis()
+    ): SegmentFile {
         val segment = SegmentFile(
             file = file,
-            createdAtMs = createdAtMs,
-            durationMs = segmentDurationMs
+            createdAtMs = startedAtMs,
+            durationMs = (finishedAtMs - startedAtMs).coerceAtLeast(1L)
         )
         replayBuffer.addSegment(segment)
         return segment

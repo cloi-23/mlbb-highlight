@@ -2,8 +2,8 @@ package com.mlbb.highlight.settings
 
 data class AppSettings(
     val bufferSeconds: Int = 30,
-    val preEventSeconds: Int = 20,
-    val postEventSeconds: Int = 10,
+    val preEventSeconds: Int = 10,
+    val postEventSeconds: Int = 2,
     val segmentLengthSeconds: Int = 5,
     val outputDirectoryName: String = "Highlights"
 ) {

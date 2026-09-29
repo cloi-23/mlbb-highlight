@@ -46,7 +46,7 @@
 - [x] Recording flow is stable enough to keep the capture service alive
 - [x] Segment rotation feeds a rolling replay buffer and removes expired segment files
 - [x] Manual highlight requests now wait for post-event footage and merge selected segments
-- [x] Play/delete/share highlight management is wired through FileProvider URIs
+- [ ] Play/delete highlight management is wired through FileProvider URIs
 - [ ] Buffer length and highlight timing are still hard-coded and need settings support
 - [ ] Segment-level clips are working toward the MVP; exact frame-level trimming is still pending
 - [ ] OCR / AI detection is intentionally deferred until the non-AI MVP works reliably
