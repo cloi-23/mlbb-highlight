@@ -1,14 +1,17 @@
 package com.mlbb.highlight.settings
 
-data class AppSettings(
-    val bufferSeconds: Int = 30,
-    val preEventSeconds: Int = 10,
-    val postEventSeconds: Int = 2,
-    val segmentLengthSeconds: Int = 5,
-    val outputDirectoryName: String = "Highlights"
-) {
-    fun bufferDurationMs(): Long = bufferSeconds * 1000L
-    fun preEventDurationMs(): Long = preEventSeconds * 1000L
-    fun postEventDurationMs(): Long = postEventSeconds * 1000L
-    fun segmentDurationMs(): Long = segmentLengthSeconds * 1000L
+enum class RecordingAudioSource {
+    SILENT,
+    DEVICE,
+    MICROPHONE,
+    DEVICE_AND_MICROPHONE
 }
+
+data class AppSettings(
+    val resolutionShortEdge: Int = 720,
+    val frameRate: Int = 30,
+    val audioSource: RecordingAudioSource = RecordingAudioSource.DEVICE,
+    val voiceCommandsEnabled: Boolean = false,
+    val saveLocationUri: String? = null,
+    val autoSave: Boolean = true
+)

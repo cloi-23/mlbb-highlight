@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -15,68 +16,64 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Environment
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.mlbb.highlight.MainActivity
 import com.mlbb.highlight.R
-import com.mlbb.highlight.highlight.ClipBuilder
-import com.mlbb.highlight.highlight.HighlightRequest
+import com.mlbb.highlight.recording.VoiceCommandActivity
+import com.mlbb.highlight.settings.AppSettings
+import com.mlbb.highlight.settings.RecordingAudioSource
+import com.mlbb.highlight.storage.HighlightRepository
 import java.io.File
-import java.util.concurrent.atomic.AtomicBoolean
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class ScreenCaptureService : Service() {
-    private lateinit var segmentDirectory: File
-    private lateinit var highlightDirectory: File
-    private lateinit var replayBuffer: ReplayBuffer
-    private lateinit var segmentManager: SegmentManager
+    private lateinit var recordingDirectory: File
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var screenRecorder: ScreenRecorder? = null
-    private var currentSegmentStartedAtMs: Long = 0L
+    private var recordingSettings = AppSettings()
     private var isReleasing = false
-    private var recordingSize: RecordingSize? = null
-    private val segmentRotationHandler = Handler(Looper.getMainLooper())
-    private var segmentRotationRunnable: Runnable? = null
-    private val highlightInProgress = AtomicBoolean(false)
-    private val protectedSegmentPaths = mutableSetOf<String>()
 
     private val projectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            releaseCapture(stopProjection = false, shouldStopSelf = false)
-            isCapturing = false
-            sendCaptureStatus()
+            releaseCapture(stopProjection = false)
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        segmentDirectory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Segments")
-        highlightDirectory = File(getExternalFilesDir(null), "Highlights")
-        replayBuffer = ReplayBuffer(
-            maxDurationMs = REPLAY_BUFFER_DURATION_MS,
-            segmentDurationMs = SEGMENT_DURATION_MS,
-            onSegmentRemoved = { segment ->
-                if (segment.file.exists() && !isSegmentProtected(segment.file)) {
-                    segment.file.delete()
-                }
-            }
-        )
-        segmentManager = SegmentManager(
-            baseDirectory = segmentDirectory,
-            segmentDurationMs = SEGMENT_DURATION_MS,
-            replayBuffer = replayBuffer
-        )
+        recordingDirectory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Recordings")
+        recordingDirectory.mkdirs()
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                if (isReleasing) {
+                    sendCaptureStatus(errorMessage = "Wait for the current recording to finish saving")
+                    return START_NOT_STICKY
+                }
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 val resultData = intent.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
+                recordingSettings = AppSettings(
+                    resolutionShortEdge = intent.getIntExtra(
+                        EXTRA_RESOLUTION_SHORT_EDGE,
+                        AppSettings().resolutionShortEdge
+                    ),
+                    frameRate = intent.getIntExtra(EXTRA_FRAME_RATE, AppSettings().frameRate),
+                    audioSource = intent.getStringExtra(EXTRA_AUDIO_SOURCE)
+                        ?.let { value -> RecordingAudioSource.entries.firstOrNull { it.name == value } }
+                        ?: AppSettings().audioSource,
+                    voiceCommandsEnabled = intent.getBooleanExtra(EXTRA_VOICE_COMMANDS_ENABLED, false),
+                    saveLocationUri = intent.getStringExtra(EXTRA_SAVE_LOCATION_URI),
+                    autoSave = intent.getBooleanExtra(EXTRA_AUTO_SAVE, true)
+                )
 
                 if (resultCode != Activity.RESULT_OK || resultData == null) {
                     stopSelf()
@@ -89,11 +86,14 @@ class ScreenCaptureService : Service() {
 
             ACTION_STOP -> {
                 releaseCapture(stopProjection = true)
-                stopSelf()
             }
 
-            ACTION_MANUAL_HIGHLIGHT -> {
-                requestManualHighlight()
+            ACTION_PAUSE_RESUME -> {
+                togglePause()
+            }
+
+            ACTION_VOICE_COMMAND -> {
+                handleVoiceCommand(intent.getStringExtra(EXTRA_VOICE_COMMAND))
             }
         }
 
@@ -122,9 +122,15 @@ class ScreenCaptureService : Service() {
 
         mediaProjection = projection
         isCapturing = true
+        isPaused = false
         sendCaptureStatus()
         projection.registerCallback(projectionCallback, null)
-        createVirtualDisplay(projection)
+        try {
+            createVirtualDisplay(projection)
+        } catch (error: Exception) {
+            releaseCapture(stopProjection = true)
+            sendCaptureStatus(errorMessage = error.message ?: "Could not start recording with these settings")
+        }
     }
 
     private fun createVirtualDisplay(projection: MediaProjection) {
@@ -138,27 +144,21 @@ class ScreenCaptureService : Service() {
         val width = bounds.width().coerceAtLeast(1)
         val height = bounds.height().coerceAtLeast(1)
         val densityDpi = resources.displayMetrics.densityDpi
-        val size = calculateRecordingSize(width, height)
-        recordingSize = size
-
+        val size = calculateRecordingSize(width, height, recordingSettings.resolutionShortEdge)
         startSegmentCapture(projection, size, densityDpi)
     }
 
     private fun startSegmentCapture(projection: MediaProjection, size: RecordingSize, densityDpi: Int) {
-        val previousDisplay = virtualDisplay
-        if (previousDisplay != null) {
-            previousDisplay.release()
-        }
-
-        val previousRecorder = screenRecorder
-        if (previousRecorder != null) {
-            saveFinalRecordingSegment(previousRecorder)
-        }
-
-        segmentDirectory.mkdirs()
-        val segmentFile = segmentManager.createSegmentFile()
-        val recorder = ScreenRecorder(this, size.width, size.height, segmentFile)
-        currentSegmentStartedAtMs = System.currentTimeMillis()
+        recordingDirectory.mkdirs()
+        val recorder = ScreenRecorder(
+            this,
+            size.width,
+            size.height,
+            createRecordingFile(),
+            recordingSettings.frameRate,
+            recordingSettings.audioSource,
+            projection
+        )
         screenRecorder = recorder
 
         virtualDisplay = projection.createVirtualDisplay(
@@ -173,171 +173,131 @@ class ScreenCaptureService : Service() {
         )
     }
 
-    private fun scheduleSegmentRotation() {
-        // Android 14+ does not allow repeatedly creating VirtualDisplay instances from
-        // the same MediaProjection consent token. Keep this disabled until segmenting is
-        // moved behind a single stable capture surface.
-        segmentRotationRunnable?.let { segmentRotationHandler.removeCallbacks(it) }
-        segmentRotationRunnable = null
-    }
-
     private fun releaseCapture(stopProjection: Boolean, shouldStopSelf: Boolean = true) {
         if (isReleasing) return
         isReleasing = true
 
-        segmentRotationRunnable?.let { segmentRotationHandler.removeCallbacks(it) }
-        segmentRotationRunnable = null
-
         isCapturing = false
+        isPaused = false
         sendCaptureStatus()
 
-        virtualDisplay?.release()
+        val display = virtualDisplay
         virtualDisplay = null
+        display?.setSurface(null)
 
         val projection = mediaProjection
         mediaProjection = null
         projection?.unregisterCallback(projectionCallback)
-        if (stopProjection) {
-            projection?.stop()
-        }
 
         val recorder = screenRecorder
         screenRecorder = null
 
         Thread {
+            var savedFile: File? = null
+            val statusMessages = mutableListOf<String>()
             if (recorder != null) {
-                saveFinalRecordingSegment(recorder, currentSegmentStartedAtMs)
+                try {
+                    savedFile = saveRecording(recorder)
+                } catch (error: IllegalStateException) {
+                    statusMessages += error.message ?: "Recording could not be finalized"
+                }
+            }
+            display?.release()
+            if (stopProjection) {
+                projection?.stop()
+            }
+            if (savedFile != null) {
+                if (recordingSettings.autoSave && recordingSettings.saveLocationUri != null) {
+                    try {
+                        HighlightRepository(this).copyToFolderTree(
+                            savedFile,
+                            Uri.parse(recordingSettings.saveLocationUri)
+                        )
+                    } catch (error: IOException) {
+                        statusMessages +=
+                            "Recording saved in My Videos, but copying to the selected folder failed: " +
+                                (error.localizedMessage ?: "storage error")
+                    } catch (error: SecurityException) {
+                        statusMessages +=
+                            "Recording saved in My Videos, but Android denied access to the selected folder"
+                    } catch (error: IllegalArgumentException) {
+                        statusMessages +=
+                            "Recording saved in My Videos, but the selected folder is no longer available"
+                    }
+                }
+                showRecordingSavedNotification(savedFile)
+            }
+            if (
+                recorder != null &&
+                recordingSettings.audioSource != RecordingAudioSource.SILENT &&
+                !recorder.audioInputDetected
+            ) {
+                statusMessages +=
+                    "No audio signal was detected. Android/game may block game-audio capture; try Microphone."
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
             isReleasing = false
+            sendCaptureStatus(
+                recordingFile = savedFile,
+                errorMessage = statusMessages.takeIf { it.isNotEmpty() }?.joinToString("\n")
+                    ?: if (savedFile == null && recorder != null) {
+                    "Recording could not be saved"
+                } else null
+            )
             if (shouldStopSelf) {
                 stopSelf()
             }
         }.start()
     }
 
-    private fun saveFinalRecordingSegment(recorder: ScreenRecorder?, startedAtMs: Long = currentSegmentStartedAtMs) {
-        val recordingFile = recorder?.stop() ?: return
-        if (!recordingFile.exists() || recordingFile.length() <= 0L) return
-
-        segmentManager.registerSegment(recordingFile, startedAtMs)
-        sendCaptureStatus(recordingFile = recordingFile)
+    private fun saveRecording(recorder: ScreenRecorder): File? {
+        val output = recorder.stop()
+        return output.takeIf { it.isFile && it.length() > 0L }
     }
 
-    private fun requestManualHighlight() {
-        if (!isCapturing || mediaProjection == null) {
-            sendHighlightStatus("Start capture before saving a highlight")
-            return
-        }
-
-        if (!highlightInProgress.compareAndSet(false, true)) {
-            sendHighlightStatus("Highlight already in progress")
-            return
-        }
-
-        val request = HighlightRequest(triggerTimeMs = System.currentTimeMillis())
-        val preEventSegments = replayBuffer.getSegmentsForWindow(request.startTimeMs, request.triggerTimeMs)
-        protectSegments(preEventSegments)
-        sendHighlightStatus("Saving highlight: 10s before + 2s after")
-        segmentRotationHandler.postDelayed(
-            {
-                finalizeManualHighlight(request, preEventSegments)
-            },
-            request.postEventDurationMs
+    private fun launchVoiceCommand() {
+        if (!recordingSettings.voiceCommandsEnabled) return
+        startActivity(
+            Intent(this, VoiceCommandActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         )
     }
 
-    private fun finalizeManualHighlight(request: HighlightRequest, preEventSegments: List<SegmentFile>) {
-        val projection = mediaProjection
-        val recorder = screenRecorder
-        val activeSegmentStartedAtMs = currentSegmentStartedAtMs
-        if (!isCapturing || projection == null || recorder == null) {
-            unprotectSegments(preEventSegments)
-            highlightInProgress.set(false)
-            sendHighlightStatus("Capture stopped before highlight was ready")
-            return
+    private fun handleVoiceCommand(command: String?) {
+        when (command?.trim()?.lowercase(Locale.ROOT)) {
+            "pause", "pause recording", "pause the recording" -> if (!isPaused) togglePause()
+            "resume", "resume recording", "continue recording" -> if (isPaused) togglePause()
+            "stop", "stop recording", "finish recording" -> releaseCapture(stopProjection = true)
+            else -> sendCaptureStatus(errorMessage = "Command not recognized. Say Pause, Resume, or Stop.")
+        }
+    }
+
+    private fun togglePause() {
+        if (!isCapturing || isReleasing) return
+        val recorder = screenRecorder ?: return
+        val display = virtualDisplay ?: return
+
+        if (isPaused) {
+            recorder.resume()
+            display.setSurface(recorder.inputSurface)
+            isPaused = false
+        } else {
+            recorder.pause()
+            display.setSurface(null)
+            isPaused = true
         }
 
-        virtualDisplay?.release()
-        virtualDisplay = null
-        screenRecorder = null
-        mediaProjection = null
-        isCapturing = false
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
         sendCaptureStatus()
-
-        runCatching { projection.unregisterCallback(projectionCallback) }
-        runCatching { projection.stop() }
-
-        Thread {
-            try {
-                val recordingFile = recorder.stop()
-                val activeSegment = if (recordingFile.exists() && recordingFile.length() > 0L) {
-                    segmentManager.registerSegment(
-                        file = recordingFile,
-                        startedAtMs = activeSegmentStartedAtMs,
-                        finishedAtMs = System.currentTimeMillis()
-                    )
-                } else {
-                    null
-                }
-
-                val selectedSegments = (
-                    preEventSegments +
-                        listOfNotNull(activeSegment) +
-                        replayBuffer.getSegmentsForWindow(request.triggerTimeMs, request.endTimeMs)
-                    ).distinctBy { it.file.absolutePath }
-
-                if (selectedSegments.isEmpty()) {
-                    sendHighlightStatus("No replay footage available for highlight")
-                    return@Thread
-                }
-
-                val outputFile = ClipBuilder(highlightDirectory).buildWindowFromSegments(
-                    selectedSegments,
-                    "highlight_${request.timestampName()}.mp4",
-                    request.startTimeMs,
-                    request.endTimeMs
-                )
-                sendHighlightStatus("Highlight saved. Capture stopped.", outputFile)
-                showHighlightSavedNotification(outputFile)
-            } catch (error: Exception) {
-                sendHighlightStatus("Highlight failed: ${error.message ?: "unknown error"}")
-            } finally {
-                unprotectSegments(preEventSegments)
-                highlightInProgress.set(false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
-        }.start()
     }
 
-    private fun protectSegments(segments: List<SegmentFile>) {
-        synchronized(protectedSegmentPaths) {
-            segments.forEach { protectedSegmentPaths.add(it.file.absolutePath) }
-        }
-    }
-
-    private fun unprotectSegments(segments: List<SegmentFile>) {
-        val currentPaths = replayBuffer.currentSegments().mapTo(mutableSetOf()) { it.file.absolutePath }
-        synchronized(protectedSegmentPaths) {
-            segments.forEach { segment ->
-                protectedSegmentPaths.remove(segment.file.absolutePath)
-                if (segment.file.absolutePath !in currentPaths && segment.file.exists()) {
-                    segment.file.delete()
-                }
-            }
-        }
-    }
-
-    private fun isSegmentProtected(file: File): Boolean {
-        return synchronized(protectedSegmentPaths) {
-            file.absolutePath in protectedSegmentPaths
-        }
-    }
-
-    private fun calculateRecordingSize(screenWidth: Int, screenHeight: Int): RecordingSize {
-        val longEdge = screenWidth.coerceAtLeast(screenHeight)
-        val scale = (MAX_RECORDING_LONG_EDGE.toFloat() / longEdge).coerceAtMost(1f)
+    private fun calculateRecordingSize(
+        screenWidth: Int,
+        screenHeight: Int,
+        requestedShortEdge: Int
+    ): RecordingSize {
+        val shortEdge = screenWidth.coerceAtMost(screenHeight)
+        val scale = (requestedShortEdge.toFloat() / shortEdge).coerceAtMost(1f)
         val width = makeEven((screenWidth * scale).toInt().coerceAtLeast(2))
         val height = makeEven((screenHeight * scale).toInt().coerceAtLeast(2))
         return RecordingSize(width, height)
@@ -347,31 +307,27 @@ class ScreenCaptureService : Service() {
         return if (value % 2 == 0) value else value - 1
     }
 
-    private fun sendCaptureStatus(recordingFile: File? = null, recordingUri: android.net.Uri? = null) {
+    private fun sendCaptureStatus(
+        recordingFile: File? = null,
+        recordingUri: android.net.Uri? = null,
+        errorMessage: String? = null
+    ) {
         sendBroadcast(
             Intent(ACTION_STATUS_CHANGED)
                 .setPackage(packageName)
                 .putExtra(EXTRA_IS_CAPTURING, isCapturing)
+                .putExtra(EXTRA_IS_PAUSED, isPaused)
                 .putExtra(EXTRA_RECORDING_URI, recordingUri?.toString())
                 .putExtra(EXTRA_RECORDING_PATH, recordingFile?.absolutePath)
+                .putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
         )
     }
 
-    private fun sendHighlightStatus(message: String, highlightFile: File? = null) {
-        sendBroadcast(
-            Intent(ACTION_HIGHLIGHT_STATUS_CHANGED)
-                .setPackage(packageName)
-                .putExtra(EXTRA_HIGHLIGHT_MESSAGE, message)
-                .putExtra(EXTRA_HIGHLIGHT_PATH, highlightFile?.absolutePath)
-                .putExtra(EXTRA_IS_HIGHLIGHT_IN_PROGRESS, highlightInProgress.get())
-        )
-    }
-
-    private fun showHighlightSavedNotification(highlightFile: File) {
+    private fun showRecordingSavedNotification(recordingFile: File) {
         val uri = androidx.core.content.FileProvider.getUriForFile(
             this,
             "$packageName.fileprovider",
-            highlightFile
+            recordingFile
         )
         val viewIntent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "video/mp4")
@@ -380,8 +336,8 @@ class ScreenCaptureService : Service() {
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_screen_capture)
-            .setContentTitle("Highlight saved")
-            .setContentText(highlightFile.name)
+            .setContentTitle("Recording saved")
+            .setContentText(recordingFile.name)
             .setContentIntent(
                 PendingIntent.getActivity(
                     this,
@@ -394,15 +350,31 @@ class ScreenCaptureService : Service() {
             .setOnlyAlertOnce(true)
             .build()
 
-        getSystemService(NotificationManager::class.java).notify(HIGHLIGHT_SAVED_NOTIFICATION_ID, notification)
+        getSystemService(NotificationManager::class.java).notify(RECORDING_SAVED_NOTIFICATION_ID, notification)
+    }
+
+    private fun createRecordingFile(): File {
+        val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss_SSS", Locale.US).format(Date())
+        return File(recordingDirectory, "recording_$timestamp.mp4")
     }
 
     private fun startForegroundForProjection() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val serviceTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
+                if (
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                    (recordingSettings.audioSource == RecordingAudioSource.MICROPHONE ||
+                        recordingSettings.audioSource == RecordingAudioSource.DEVICE_AND_MICROPHONE ||
+                        recordingSettings.voiceCommandsEnabled)
+                ) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                } else {
+                    0
+                }
             startForeground(
                 NOTIFICATION_ID,
                 buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                serviceTypes
             )
         } else {
             startForeground(NOTIFICATION_ID, buildNotification())
@@ -414,8 +386,8 @@ class ScreenCaptureService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_screen_capture)
-            .setContentTitle("MLBB Highlight")
-            .setContentText("Screen capture is running")
+            .setContentTitle("MLBB Gameplay Recorder")
+            .setContentText(if (isPaused) "Recording is paused" else "Screen recording is running")
             .setContentIntent(
                 PendingIntent.getActivity(
                     this,
@@ -424,6 +396,40 @@ class ScreenCaptureService : Service() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
             )
+            .addAction(
+                0,
+                if (isPaused) "Resume" else "Pause",
+                PendingIntent.getService(
+                    this,
+                    PAUSE_ACTION_REQUEST_CODE,
+                    pauseResumeIntent(this),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
+            .addAction(
+                0,
+                "Stop",
+                PendingIntent.getService(
+                    this,
+                    STOP_ACTION_REQUEST_CODE,
+                    stopIntent(this),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
+            .apply {
+                if (recordingSettings.voiceCommandsEnabled) {
+                    addAction(
+                        0,
+                        "Voice",
+                        PendingIntent.getActivity(
+                            this@ScreenCaptureService,
+                            VOICE_ACTION_REQUEST_CODE,
+                            Intent(this@ScreenCaptureService, VoiceCommandActivity::class.java),
+                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                        )
+                    )
+                }
+            }
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
@@ -450,39 +456,59 @@ class ScreenCaptureService : Service() {
     companion object {
         private const val CHANNEL_ID = "screen_capture"
         private const val NOTIFICATION_ID = 1001
-        private const val HIGHLIGHT_SAVED_NOTIFICATION_ID = 1003
+        private const val RECORDING_SAVED_NOTIFICATION_ID = 1003
+        private const val PAUSE_ACTION_REQUEST_CODE = 1004
+        private const val STOP_ACTION_REQUEST_CODE = 1005
+        private const val VOICE_ACTION_REQUEST_CODE = 1006
         private const val VIRTUAL_DISPLAY_NAME = "MLBBHighlightCapture"
-        private const val MAX_RECORDING_LONG_EDGE = 1280
-        private const val SEGMENT_DURATION_MS = 5_000L
-        private const val REPLAY_BUFFER_DURATION_MS = 30_000L
         private const val EXTRA_RESULT_CODE = "extra_result_code"
         private const val EXTRA_RESULT_DATA = "extra_result_data"
+        private const val EXTRA_RESOLUTION_SHORT_EDGE = "extra_resolution_short_edge"
+        private const val EXTRA_FRAME_RATE = "extra_frame_rate"
+        private const val EXTRA_AUDIO_SOURCE = "extra_audio_source"
+        private const val EXTRA_VOICE_COMMANDS_ENABLED = "extra_voice_commands_enabled"
+        private const val EXTRA_SAVE_LOCATION_URI = "extra_save_location_uri"
+        private const val EXTRA_AUTO_SAVE = "extra_auto_save"
+        const val EXTRA_VOICE_COMMAND = "extra_voice_command"
         const val EXTRA_IS_CAPTURING = "extra_is_capturing"
+        const val EXTRA_IS_PAUSED = "extra_is_paused"
+        const val EXTRA_ERROR_MESSAGE = "extra_error_message"
         const val EXTRA_RECORDING_URI = "extra_recording_uri"
         const val EXTRA_RECORDING_PATH = "extra_recording_path"
-        const val EXTRA_HIGHLIGHT_PATH = "extra_highlight_path"
-        const val EXTRA_HIGHLIGHT_MESSAGE = "extra_highlight_message"
-        const val EXTRA_IS_HIGHLIGHT_IN_PROGRESS = "extra_is_highlight_in_progress"
 
         const val ACTION_START = "com.mlbb.highlight.recording.action.START"
         const val ACTION_STOP = "com.mlbb.highlight.recording.action.STOP"
-        const val ACTION_MANUAL_HIGHLIGHT = "com.mlbb.highlight.recording.action.MANUAL_HIGHLIGHT"
+        const val ACTION_PAUSE_RESUME = "com.mlbb.highlight.recording.action.PAUSE_RESUME"
+        const val ACTION_VOICE_COMMAND = "com.mlbb.highlight.recording.action.VOICE_COMMAND"
         const val ACTION_STATUS_CHANGED = "com.mlbb.highlight.recording.action.STATUS_CHANGED"
-        const val ACTION_HIGHLIGHT_STATUS_CHANGED = "com.mlbb.highlight.recording.action.HIGHLIGHT_STATUS_CHANGED"
 
         @Volatile
         var isCapturing: Boolean = false
+            private set
+        @Volatile
+        var isPaused: Boolean = false
             private set
 
         fun setCapturing(value: Boolean) {
             isCapturing = value
         }
 
-        fun startIntent(context: Context, resultCode: Int, resultData: Intent): Intent {
+        fun startIntent(
+            context: Context,
+            resultCode: Int,
+            resultData: Intent,
+            settings: AppSettings
+        ): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, resultData)
+                putExtra(EXTRA_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
+                putExtra(EXTRA_FRAME_RATE, settings.frameRate)
+                putExtra(EXTRA_AUDIO_SOURCE, settings.audioSource.name)
+                putExtra(EXTRA_VOICE_COMMANDS_ENABLED, settings.voiceCommandsEnabled)
+                putExtra(EXTRA_SAVE_LOCATION_URI, settings.saveLocationUri)
+                putExtra(EXTRA_AUTO_SAVE, settings.autoSave)
             }
         }
 
@@ -492,9 +518,16 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        fun manualHighlightIntent(context: Context): Intent {
+        fun pauseResumeIntent(context: Context): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
-                action = ACTION_MANUAL_HIGHLIGHT
+                action = ACTION_PAUSE_RESUME
+            }
+        }
+
+        fun voiceCommandIntent(context: Context, command: String): Intent {
+            return Intent(context, ScreenCaptureService::class.java).apply {
+                action = ACTION_VOICE_COMMAND
+                putExtra(EXTRA_VOICE_COMMAND, command)
             }
         }
     }

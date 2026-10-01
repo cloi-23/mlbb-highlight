@@ -6,42 +6,57 @@ import androidx.core.content.edit
 class SettingsRepository(context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    fun getBufferSeconds(): Int = prefs.getInt(KEY_BUFFER_SECONDS, DEFAULT_BUFFER_SECONDS)
-    fun setBufferSeconds(value: Int) = prefs.edit { putInt(KEY_BUFFER_SECONDS, value) }
+    fun load(): AppSettings {
+        val savedAudioSource = prefs.getString(KEY_AUDIO_SOURCE, null)
+        val audioSource = savedAudioSource
+            ?.let { value -> RecordingAudioSource.entries.firstOrNull { it.name == value } }
+            ?: if (prefs.contains(KEY_INCLUDE_AUDIO)) {
+                if (prefs.getBoolean(KEY_INCLUDE_AUDIO, false)) {
+                    RecordingAudioSource.DEVICE
+                } else {
+                    RecordingAudioSource.SILENT
+                }
+            } else {
+                AppSettings().audioSource
+            }
 
-    fun getPreEventSeconds(): Int = prefs.getInt(KEY_PRE_EVENT_SECONDS, DEFAULT_PRE_EVENT_SECONDS)
-    fun setPreEventSeconds(value: Int) = prefs.edit { putInt(KEY_PRE_EVENT_SECONDS, value) }
+        return AppSettings(
+            resolutionShortEdge = prefs.getInt(KEY_RESOLUTION_SHORT_EDGE, DEFAULT_RESOLUTION_SHORT_EDGE)
+                .coerceIn(HD_SHORT_EDGE, FULL_HD_SHORT_EDGE),
+            frameRate = prefs.getInt(KEY_FRAME_RATE, DEFAULT_FRAME_RATE)
+                .let { if (it == HIGH_FRAME_RATE) HIGH_FRAME_RATE else DEFAULT_FRAME_RATE },
+            audioSource = audioSource,
+            voiceCommandsEnabled = prefs.getBoolean(KEY_VOICE_COMMANDS_ENABLED, false),
+            saveLocationUri = prefs.getString(KEY_SAVE_LOCATION_URI, null),
+            autoSave = prefs.getBoolean(KEY_AUTO_SAVE, true)
+        )
+    }
 
-    fun getPostEventSeconds(): Int = prefs.getInt(KEY_POST_EVENT_SECONDS, DEFAULT_POST_EVENT_SECONDS)
-    fun setPostEventSeconds(value: Int) = prefs.edit { putInt(KEY_POST_EVENT_SECONDS, value) }
-
-    fun getSegmentLengthSeconds(): Int = prefs.getInt(KEY_SEGMENT_LENGTH_SECONDS, DEFAULT_SEGMENT_LENGTH_SECONDS)
-    fun setSegmentLengthSeconds(value: Int) = prefs.edit { putInt(KEY_SEGMENT_LENGTH_SECONDS, value) }
-
-    fun load(): AppSettings = AppSettings(
-        bufferSeconds = getBufferSeconds(),
-        preEventSeconds = getPreEventSeconds(),
-        postEventSeconds = getPostEventSeconds(),
-        segmentLengthSeconds = getSegmentLengthSeconds()
-    )
-
-    fun save(appSettings: AppSettings) {
-        setBufferSeconds(appSettings.bufferSeconds)
-        setPreEventSeconds(appSettings.preEventSeconds)
-        setPostEventSeconds(appSettings.postEventSeconds)
-        setSegmentLengthSeconds(appSettings.segmentLengthSeconds)
+    fun save(settings: AppSettings) {
+        prefs.edit {
+            putInt(KEY_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
+            putInt(KEY_FRAME_RATE, settings.frameRate)
+            putString(KEY_AUDIO_SOURCE, settings.audioSource.name)
+            putBoolean(KEY_VOICE_COMMANDS_ENABLED, settings.voiceCommandsEnabled)
+            putString(KEY_SAVE_LOCATION_URI, settings.saveLocationUri)
+            putBoolean(KEY_AUTO_SAVE, settings.autoSave)
+        }
     }
 
     companion object {
-        private const val PREFS_NAME = "mlbb_highlight_settings"
-        private const val KEY_BUFFER_SECONDS = "buffer_seconds"
-        private const val KEY_PRE_EVENT_SECONDS = "pre_event_seconds"
-        private const val KEY_POST_EVENT_SECONDS = "post_event_seconds"
-        private const val KEY_SEGMENT_LENGTH_SECONDS = "segment_length_seconds"
+        const val HD_SHORT_EDGE = 720
+        const val FULL_HD_SHORT_EDGE = 1080
+        const val DEFAULT_RESOLUTION_SHORT_EDGE = HD_SHORT_EDGE
+        const val DEFAULT_FRAME_RATE = 30
+        const val HIGH_FRAME_RATE = 60
 
-        private const val DEFAULT_BUFFER_SECONDS = 30
-        private const val DEFAULT_PRE_EVENT_SECONDS = 20
-        private const val DEFAULT_POST_EVENT_SECONDS = 10
-        private const val DEFAULT_SEGMENT_LENGTH_SECONDS = 5
+        private const val PREFS_NAME = "mlbb_recording_settings"
+        private const val KEY_RESOLUTION_SHORT_EDGE = "resolution_short_edge"
+        private const val KEY_FRAME_RATE = "frame_rate"
+        private const val KEY_AUDIO_SOURCE = "audio_source"
+        private const val KEY_VOICE_COMMANDS_ENABLED = "voice_commands_enabled"
+        private const val KEY_INCLUDE_AUDIO = "include_audio"
+        private const val KEY_SAVE_LOCATION_URI = "save_location_uri"
+        private const val KEY_AUTO_SAVE = "auto_save"
     }
 }

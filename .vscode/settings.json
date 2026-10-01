@@ -1,0 +1,8 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "/^pwd && git --no-pager status --short --branch && printf '\\\\n---ROOT---\\\\n' && find \\. -maxdepth 2 -mindepth 1 \\| sort \\| sed 's#\\^\\./##' \\| head -200$/": {
+      "approve": true,
+      "matchCommandLine": true
+    }
+  }
+}
