@@ -26,9 +26,7 @@ class SettingsRepository(context: Context) {
             frameRate = prefs.getInt(KEY_FRAME_RATE, DEFAULT_FRAME_RATE)
                 .let { if (it == HIGH_FRAME_RATE) HIGH_FRAME_RATE else DEFAULT_FRAME_RATE },
             audioSource = audioSource,
-            voiceCommandsEnabled = prefs.getBoolean(KEY_VOICE_COMMANDS_ENABLED, false),
-            saveLocationUri = prefs.getString(KEY_SAVE_LOCATION_URI, null),
-            autoSave = prefs.getBoolean(KEY_AUTO_SAVE, true)
+            saveLocationUri = prefs.getString(KEY_SAVE_LOCATION_URI, null)
         )
     }
 
@@ -37,9 +35,7 @@ class SettingsRepository(context: Context) {
             putInt(KEY_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
             putInt(KEY_FRAME_RATE, settings.frameRate)
             putString(KEY_AUDIO_SOURCE, settings.audioSource.name)
-            putBoolean(KEY_VOICE_COMMANDS_ENABLED, settings.voiceCommandsEnabled)
             putString(KEY_SAVE_LOCATION_URI, settings.saveLocationUri)
-            putBoolean(KEY_AUTO_SAVE, settings.autoSave)
         }
     }
 
@@ -54,9 +50,7 @@ class SettingsRepository(context: Context) {
         private const val KEY_RESOLUTION_SHORT_EDGE = "resolution_short_edge"
         private const val KEY_FRAME_RATE = "frame_rate"
         private const val KEY_AUDIO_SOURCE = "audio_source"
-        private const val KEY_VOICE_COMMANDS_ENABLED = "voice_commands_enabled"
         private const val KEY_INCLUDE_AUDIO = "include_audio"
         private const val KEY_SAVE_LOCATION_URI = "save_location_uri"
-        private const val KEY_AUTO_SAVE = "auto_save"
     }
 }

@@ -7,14 +7,20 @@ import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.sin
 
-fun createKillShakeEffect(intensity: Float, sceneStartUs: Long): GlEffect {
-    val amplitude = 0.018f * intensity.coerceIn(0f, 1f)
-    val zoom = 1.04f + 0.025f * intensity.coerceIn(0f, 1f)
+fun createKillShakeEffect(
+    intensity: Float,
+    shakeAmount: Float,
+    eventTimeUs: Long,
+    sceneEndUs: Long
+): GlEffect {
+    val amplitude = 0.018f * intensity.coerceIn(0f, 1f) * shakeAmount.coerceIn(0f, 1f)
+    val zoom = 1.015f + 0.025f * intensity.coerceIn(0f, 1f)
     val decayPerSecond = 2.8f
     val frequencyHz = 13f
 
-    return MatrixTransformation { presentationTimeUs ->
-        val timeSeconds = (presentationTimeUs - sceneStartUs).coerceAtLeast(0L) / 1_000_000f
+    return androidx.media3.effect.TimestampWrapper(
+        MatrixTransformation { presentationTimeUs ->
+        val timeSeconds = (presentationTimeUs - eventTimeUs).coerceAtLeast(0L) / 1_000_000f
         val decay = exp(-decayPerSecond * timeSeconds)
         val oscillation = sin(2.0 * PI * frequencyHz * timeSeconds).toFloat()
         Matrix().apply {
@@ -24,5 +30,8 @@ fun createKillShakeEffect(intensity: Float, sceneStartUs: Long): GlEffect {
                 amplitude * 0.65f * sin(2.0 * PI * (frequencyHz * 0.82f) * timeSeconds).toFloat() * decay
             )
         }
-    }
+        },
+        eventTimeUs,
+        sceneEndUs.coerceAtLeast(eventTimeUs + 1L)
+    )
 }

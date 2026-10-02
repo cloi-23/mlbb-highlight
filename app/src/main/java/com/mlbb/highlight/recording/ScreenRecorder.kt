@@ -14,6 +14,7 @@ import android.os.Environment
 import android.view.Surface
 import com.mlbb.highlight.settings.RecordingAudioSource
 import java.io.File
+import java.io.FileDescriptor
 import java.util.ArrayDeque
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -30,11 +31,16 @@ class ScreenRecorder(
     outputFile: File? = null,
     private val frameRate: Int = DEFAULT_FRAME_RATE,
     private val audioSource: RecordingAudioSource = RecordingAudioSource.SILENT,
-    projection: MediaProjection? = null
+    projection: MediaProjection? = null,
+    outputFileDescriptor: FileDescriptor? = null
 ) {
     private val appContext = context.applicationContext
-    private val outputPath: File = outputFile ?: createOutputFile()
-    private val muxer = MediaMuxer(outputPath.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    private val outputPath: File? = outputFile ?: if (outputFileDescriptor == null) createOutputFile() else null
+    private val muxer = if (outputFileDescriptor != null) {
+        MediaMuxer(outputFileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    } else {
+        MediaMuxer(checkNotNull(outputPath).absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+    }
     private val hasAudio = audioSource != RecordingAudioSource.SILENT
     private val muxerCoordinator = MuxerCoordinator(muxer, if (hasAudio) 2 else 1)
     private val videoEncoder = createVideoEncoder()
@@ -56,7 +62,7 @@ class ScreenRecorder(
     private val videoDrainThread: Thread
     private val audioDrainThread: Thread?
 
-    val outputFile: File
+    val outputFile: File?
         get() = outputPath
     val inputSurface: Surface
         get() = videoInputSurface
@@ -87,7 +93,7 @@ class ScreenRecorder(
         }
     }
 
-    fun stop(): File {
+    fun stop(): File? {
         if (isStopping.compareAndSet(false, true)) {
             closeCurrentPause()
             videoEncoder.signalEndOfInputStream()

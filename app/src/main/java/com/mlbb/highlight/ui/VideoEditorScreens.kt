@@ -24,18 +24,10 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.ContentCut
 import androidx.compose.material.icons.outlined.Crop
-import androidx.compose.material.icons.outlined.FlashOn
-import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.LinearScale
-import androidx.compose.material.icons.outlined.Movie
-import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
-import androidx.compose.material.icons.outlined.StarOutline
-import androidx.compose.material.icons.outlined.Timer
-import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.VideoLibrary
-import androidx.compose.material.icons.outlined.Vibration
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Button
@@ -48,7 +40,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -82,7 +73,6 @@ import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
@@ -94,8 +84,16 @@ enum class VideoEffectPreset(val label: String) {
     NONE("Original"),
     CINEMATIC("Cinematic"),
     NEON("Neon"),
-    SLOW_MOTION("Slow Motion"),
-    FLASH("Flash")
+    SLOW_MOTION("Slow-mo"),
+    FLASH("Flash"),
+    IMPACT("Impact"),
+    SHAKE("Shake"),
+    ZOOM("Zoom"),
+    GLOW("Glow"),
+    IMPACT_OVERLAY("Hit Overlay"),
+    KILL_IMPACT("Kill Impact"),
+    KILL_SLOWMO("Kill Slowmo"),
+    SAVAGE("Savage")
 }
 
 data class VideoEffectOptions(
@@ -105,7 +103,10 @@ data class VideoEffectOptions(
     val slowMotionSpeed: Float = 0.5f,
     val shakeEnabled: Boolean = false,
     val flashEnabled: Boolean = false,
-    val colorGrading: Float = 0.5f
+    val colorGrading: Float = 0.5f,
+    val zoomScale: Float = 1.06f,
+    val shakeAmount: Float = 0.5f,
+    val opacity: Float = 0.7f
 )
 
 @Composable
@@ -304,7 +305,9 @@ private fun VideoTimeline(
     durationMs: Long,
     startMs: Long,
     endMs: Long,
-    onTrimChanged: (Long, Long) -> Unit
+    onTrimChanged: (Long, Long) -> Unit,
+    markerTimesMs: List<Long> = emptyList(),
+    playheadMs: Long = 0L
 ) {
     val thumbnailState by produceState(
         initialValue = TimelineThumbnails(),
@@ -370,19 +373,45 @@ private fun VideoTimeline(
             .background(RecorderTheme.surfaceRaised)
             .onSizeChanged { timelineWidthPx = it.width.toFloat() }
             .pointerInput(durationMs) {
-                var movingStart = true
+                var dragMode = 0
+                var dragOriginX = 0f
+                var initialRangeStart = 0L
+                var initialRangeEnd = 0L
                 detectDragGestures(
                     onDragStart = { position ->
                         val widthPx = size.width.toFloat().coerceAtLeast(1f)
                         val videoDuration = durationMs.coerceAtLeast(1L).toFloat()
                         val startX = currentStart / videoDuration * widthPx
                         val endX = currentEnd / videoDuration * widthPx
-                        movingStart = kotlin.math.abs(position.x - startX) <=
+                        val onStartHandle = kotlin.math.abs(position.x - startX) <=
                             kotlin.math.abs(position.x - endX)
-                        updateHandle(position.x, movingStart)
+                        dragMode = if (
+                            position.x > startX + 24.dp.toPx() &&
+                            position.x < endX - 24.dp.toPx()
+                        ) {
+                            2
+                        } else if (onStartHandle) {
+                            0
+                        } else {
+                            1
+                        }
+                        dragOriginX = position.x
+                        initialRangeStart = currentStart
+                        initialRangeEnd = currentEnd
+                        if (dragMode != 2) updateHandle(position.x, dragMode == 0)
                     },
                     onDrag = { change, _ ->
-                        updateHandle(change.position.x, movingStart)
+                        if (dragMode == 2 && durationMs > 0L && timelineWidthPx > 0f) {
+                            val deltaMs = (
+                                (change.position.x - dragOriginX) / timelineWidthPx * durationMs
+                                ).roundToLong()
+                            val rangeLength = initialRangeEnd - initialRangeStart
+                            val nextStart = (initialRangeStart + deltaMs)
+                                .coerceIn(0L, (durationMs - rangeLength).coerceAtLeast(0L))
+                            currentOnTrimChanged(nextStart, nextStart + rangeLength)
+                        } else {
+                            updateHandle(change.position.x, dragMode == 0)
+                        }
                         change.consume()
                     }
                 )
@@ -449,6 +478,27 @@ private fun VideoTimeline(
                     center = Offset(handleX, 8.dp.toPx())
                 )
             }
+            markerTimesMs.forEach { markerMs ->
+                val markerX = size.width * (markerMs.toFloat() / durationMs).coerceIn(0f, 1f)
+                drawLine(
+                    color = RecorderTheme.purple,
+                    start = Offset(markerX, 0f),
+                    end = Offset(markerX, size.height),
+                    strokeWidth = 2.dp.toPx()
+                )
+                drawCircle(
+                    color = RecorderTheme.purple,
+                    radius = 5.dp.toPx(),
+                    center = Offset(markerX, 7.dp.toPx())
+                )
+            }
+            val playheadX = size.width * (playheadMs.toFloat() / durationMs).coerceIn(0f, 1f)
+            drawLine(
+                color = Color.White,
+                start = Offset(playheadX, 0f),
+                end = Offset(playheadX, size.height),
+                strokeWidth = 2.dp.toPx()
+            )
         }
     }
     if (thumbnailState.errorMessage != null) {
@@ -468,11 +518,15 @@ fun EffectsScreen(
     effectStartMs: Long,
     effectEndMs: Long,
     isPreviewApplied: Boolean,
-    appliedEffectOptions: VideoEffectOptions,
-    appliedEffectStartMs: Long,
-    appliedEffectEndMs: Long,
     previewRequestId: Int,
+    sceneEffects: List<SceneEffect>,
+    selectedSceneId: String,
+    appliedSceneEffects: List<SceneEffect>,
+    playheadMs: Long,
     onEffectRangeChanged: (Long, Long) -> Unit,
+    onSceneEffectsChanged: (List<SceneEffect>) -> Unit,
+    onSceneSelected: (SceneEffect) -> Unit,
+    onPlayheadChanged: (Long) -> Unit,
     onDurationChanged: (Long) -> Unit,
     options: VideoEffectOptions,
     onOptionsChanged: (VideoEffectOptions) -> Unit,
@@ -485,6 +539,8 @@ fun EffectsScreen(
     onBack: () -> Unit,
     onOpenVideos: () -> Unit
 ) {
+    val context = LocalContext.current
+    val selectedScene = sceneEffects.firstOrNull { it.id == selectedSceneId }
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         EditorScreenHeader(
             title = "Effects",
@@ -494,10 +550,7 @@ fun EffectsScreen(
                 if (endMs > startMs) onEffectRangeChanged(0L, endMs - startMs)
             }
         )
-        Text(
-            "Apply effects to preview the selected scene first. Export is a separate save step.",
-            color = RecorderTheme.textSecondary
-        )
+        Text("Select a scene, choose an effect, preview, then export.", color = RecorderTheme.textSecondary)
 
         if (videoUri == null) {
             EmptyEditorCard(
@@ -507,51 +560,83 @@ fun EffectsScreen(
                 onClick = onGoToTrim
             )
         } else {
-            val previewSceneStartMs = startMs + appliedEffectStartMs
-            val previewSceneEndMs = startMs + appliedEffectEndMs
             val previewVideoEffects = remember(
                 isPreviewApplied,
-                appliedEffectOptions,
-                previewSceneStartMs,
-                previewSceneEndMs
+                appliedSceneEffects,
+                startMs
             ) {
-                if (isPreviewApplied && previewSceneEndMs > previewSceneStartMs) {
-                    createSceneVideoEffects(
-                        appliedEffectOptions,
-                        previewSceneStartMs * 1_000L,
-                        previewSceneEndMs * 1_000L
-                    )
-                } else {
-                    emptyList()
+                if (!isPreviewApplied) emptyList() else appliedSceneEffects.flatMap { scene ->
+                    val sceneStartUs = (startMs + scene.startMs) * 1_000L
+                    val sceneEndUs = (startMs + scene.endMs) * 1_000L
+                    if (sceneEndUs <= sceneStartUs || scene.options.preset == VideoEffectPreset.NONE) {
+                        emptyList()
+                    } else {
+                        createSceneVideoEffects(
+                            scene.options,
+                            sceneStartUs,
+                            sceneEndUs,
+                            (startMs + (scene.eventTimeMs ?: (scene.startMs + 200L))) * 1_000L
+                        )
+                    }
                 }
             }
+            val previewSceneStartMs = startMs + (selectedScene?.startMs ?: effectStartMs)
             VideoPreview(
                 videoUri = videoUri,
                 startMs = startMs,
                 endMs = endMs,
                 onDurationChanged = onDurationChanged,
                 videoEffects = previewVideoEffects,
-                slowMotionEnabled = isPreviewApplied &&
-                    (appliedEffectOptions.slowMotionEnabled ||
-                        appliedEffectOptions.preset == VideoEffectPreset.SLOW_MOTION),
-                slowMotionStartMs = previewSceneStartMs,
-                slowMotionEndMs = previewSceneEndMs,
-                slowMotionSpeed = appliedEffectOptions.slowMotionSpeed,
+                slowMotionCues = if (isPreviewApplied) appliedSceneEffects else emptyList(),
+                onPositionChanged = { position ->
+                    onPlayheadChanged((position - startMs).coerceIn(0L, (endMs - startMs).coerceAtLeast(0L)))
+                },
+                slowMotionOffsetMs = startMs,
+                previewSeekMs = previewSceneStartMs,
                 previewRequestId = previewRequestId
             )
             if (isPreviewApplied) {
                 Text(
-                    "Preview effects are active on the selected scene. Slow motion temporarily changes playback speed only inside that range.",
+                    "Preview effects are active on their assigned scenes. Slow motion changes playback speed only inside those ranges.",
                     color = RecorderTheme.cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            Text("Effect Scene", style = MaterialTheme.typography.titleSmall, color = RecorderTheme.textPrimary)
-            Text(
-                "Drag the handles to choose where enabled effects should appear.",
-                style = MaterialTheme.typography.bodySmall,
-                color = RecorderTheme.textSecondary
-            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = {
+                        val clipDuration = (endMs - startMs).coerceAtLeast(0L)
+                        if (clipDuration > 0L) {
+                            val id = "scene-${System.currentTimeMillis()}"
+                            val sceneStart = (playheadMs - 200L).coerceIn(0L, clipDuration)
+                            val sceneEnd = (playheadMs + 350L).coerceIn(sceneStart, clipDuration)
+                            val manual = SceneEffect(
+                                id = id,
+                                label = "Scene ${sceneEffects.count { it.eventTimeMs == null } + 1}",
+                                eventTimeMs = null,
+                                startMs = sceneStart,
+                                endMs = sceneEnd
+                            )
+                            onSceneEffectsChanged(sceneEffects + manual)
+                            onSceneSelected(manual)
+                        }
+                    },
+                    enabled = endMs > startMs && !isExporting
+                ) {
+                    Text("Select Scene")
+                }
+            }
+            if (sceneEffects.isNotEmpty()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    sceneEffects.forEach { scene ->
+                        FilterChip(
+                            selected = scene.id == selectedSceneId,
+                            onClick = { onSceneSelected(scene) },
+                            label = { Text(scene.label) }
+                        )
+                    }
+                }
+            }
             VideoTimeline(
                 context = LocalContext.current,
                 videoUri = videoUri,
@@ -559,17 +644,16 @@ fun EffectsScreen(
                 durationMs = (endMs - startMs).coerceAtLeast(0L),
                 startMs = effectStartMs,
                 endMs = effectEndMs,
-                onTrimChanged = onEffectRangeChanged
+                onTrimChanged = onEffectRangeChanged,
+                markerTimesMs = sceneEffects.mapNotNull { it.eventTimeMs },
+                playheadMs = playheadMs
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(formatEditorTime(effectStartMs), color = RecorderTheme.textSecondary)
-                Text(
-                    "Scene ${formatEditorTime(effectEndMs - effectStartMs)} / Clip ${formatEditorTime(endMs - startMs)}",
-                    color = RecorderTheme.cyan
-                )
+                Text("Selected scene", color = RecorderTheme.cyan)
                 Text(formatEditorTime(endMs - startMs), color = RecorderTheme.textSecondary)
             }
         }
@@ -581,155 +665,77 @@ fun EffectsScreen(
         ) {
             Column(
                 modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Effect presets", style = MaterialTheme.typography.titleMedium, color = RecorderTheme.textPrimary)
-                FilterChip(
-                    selected = options.preset == VideoEffectPreset.NONE,
-                    onClick = { onOptionsChanged(VideoEffectOptions()) },
-                    label = { Text(VideoEffectPreset.NONE.label) },
-                    leadingIcon = { Icon(Icons.Outlined.Movie, contentDescription = null) }
+                Text(
+                    selectedScene?.let { "Effect · ${it.label}" } ?: "Choose a scene first",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = RecorderTheme.textPrimary
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        VideoEffectPreset.CINEMATIC to Icons.Outlined.Movie,
-                        VideoEffectPreset.NEON to Icons.Outlined.StarOutline
-                    ).forEach { (preset, icon) ->
-                        FilterChip(
-                            selected = options.preset == preset,
-                            onClick = { onOptionsChanged(options.copy(preset = preset)) },
-                            label = { Text(preset.label) },
-                            leadingIcon = { Icon(icon, contentDescription = null) }
-                        )
-                    }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf(
-                        VideoEffectPreset.SLOW_MOTION to Icons.Outlined.Timer,
-                        VideoEffectPreset.FLASH to Icons.Outlined.FlashOn
-                    ).forEach { (preset, icon) ->
-                        FilterChip(
-                            selected = options.preset == preset,
+                if (selectedScene != null) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
                             onClick = {
-                                onOptionsChanged(
-                                    when (preset) {
-                                        VideoEffectPreset.SLOW_MOTION -> options.copy(
-                                            preset = preset,
-                                            slowMotionEnabled = true
-                                        )
-                                        VideoEffectPreset.FLASH -> options.copy(
-                                            preset = preset,
-                                            flashEnabled = true
-                                        )
-                                        else -> options.copy(preset = preset)
+                                onSceneEffectsChanged(
+                                    sceneEffects.map { scene ->
+                                        if (scene.id == selectedScene.id) {
+                                            scene.copy(eventTimeMs = playheadMs.coerceIn(scene.startMs, scene.endMs))
+                                        } else scene
                                     }
                                 )
-                            },
-                            label = { Text(preset.label) },
-                            leadingIcon = { Icon(icon, contentDescription = null) }
-                        )
+                            }
+                        ) { Text("Set event") }
+                        OutlinedButton(
+                            onClick = {
+                                val remaining = sceneEffects.filterNot { it.id == selectedScene.id }
+                                onSceneEffectsChanged(remaining)
+                                remaining.firstOrNull()?.let(onSceneSelected)
+                            }
+                        ) { Text("Remove scene") }
                     }
                 }
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    ReferenceIconTile(
-                        image = Icons.Outlined.GraphicEq,
-                        tint = RecorderTheme.purple,
-                        tileSize = 42.dp,
-                        iconSize = 23.dp
-                    )
-                    Column {
-                        Text("Intensity", color = RecorderTheme.textPrimary)
-                        Text(
-                            "${(options.intensity * 100).roundToLong()}%",
-                            color = RecorderTheme.textSecondary
-                        )
-                    }
-                }
-                Slider(
-                    value = options.intensity,
-                    onValueChange = { onOptionsChanged(options.copy(intensity = it)) },
-                    valueRange = 0f..1f
+                val effectRows = listOf(
+                    listOf(VideoEffectPreset.IMPACT, VideoEffectPreset.SHAKE, VideoEffectPreset.FLASH),
+                    listOf(VideoEffectPreset.SLOW_MOTION, VideoEffectPreset.ZOOM, VideoEffectPreset.GLOW),
+                    listOf(VideoEffectPreset.IMPACT_OVERLAY, VideoEffectPreset.SAVAGE, VideoEffectPreset.NONE)
                 )
-                EffectSwitchRow(
-                    title = "Kill-moment slow motion",
-                    subtitle = "Slow down only the selected scene.",
-                    icon = Icons.Outlined.Timer,
-                    checked = options.slowMotionEnabled,
-                    onCheckedChange = {
-                        onOptionsChanged(
-                            options.copy(
-                                slowMotionEnabled = it,
-                                preset = if (!it && options.preset == VideoEffectPreset.SLOW_MOTION) {
-                                    VideoEffectPreset.NONE
-                                } else {
-                                    options.preset
-                                }
+                effectRows.forEach { rowPresets ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        rowPresets.forEach { preset ->
+                            FilterChip(
+                                selected = options.preset == preset,
+                                onClick = {
+                                    onOptionsChanged(
+                                        options.copy(
+                                            preset = preset,
+                                            slowMotionEnabled = preset == VideoEffectPreset.SLOW_MOTION,
+                                            flashEnabled = preset == VideoEffectPreset.FLASH,
+                                            shakeEnabled = preset == VideoEffectPreset.SHAKE
+                                        )
+                                    )
+                                },
+                                enabled = selectedScene != null,
+                                label = { Text(if (preset == VideoEffectPreset.NONE) "Original" else preset.label) }
                             )
-                        )
+                        }
                     }
-                )
-                if (options.slowMotionEnabled) {
-                    Text(
-                        "Speed  ${(options.slowMotionSpeed * 100).roundToLong()}%",
-                        color = RecorderTheme.textSecondary
+                }
+                if (selectedScene != null && options.preset != VideoEffectPreset.NONE) {
+                    Text("Intensity · ${(options.intensity * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.intensity,
+                        onValueChange = { onOptionsChanged(options.copy(intensity = it)) },
+                        valueRange = 0.1f..1f
                     )
+                }
+                if (selectedScene != null && options.usesSlowMotion()) {
+                    Text("Slow motion · ${(options.slowMotionSpeed * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
                     Slider(
                         value = options.slowMotionSpeed,
                         onValueChange = { onOptionsChanged(options.copy(slowMotionSpeed = it)) },
                         valueRange = 0.25f..0.9f
                     )
-                    Text(
-                        "Only the selected scene slows down. Slower speeds make that scene and the final export longer.",
-                        color = RecorderTheme.textSecondary,
-                        style = MaterialTheme.typography.bodySmall
-                    )
                 }
-                EffectSwitchRow(
-                    title = "Kill shake",
-                    subtitle = "Add a camera shake to the selected scene.",
-                    icon = Icons.Outlined.Vibration,
-                    checked = options.shakeEnabled,
-                    onCheckedChange = { onOptionsChanged(options.copy(shakeEnabled = it)) }
-                )
-                EffectSwitchRow(
-                    title = "Flash look",
-                    subtitle = "Flash at the beginning of the selected scene.",
-                    icon = Icons.Outlined.FlashOn,
-                    checked = options.flashEnabled,
-                    onCheckedChange = {
-                        onOptionsChanged(
-                            options.copy(
-                                flashEnabled = it,
-                                preset = if (!it && options.preset == VideoEffectPreset.FLASH) {
-                                    VideoEffectPreset.NONE
-                                } else {
-                                    options.preset
-                                }
-                            )
-                        )
-                    }
-                )
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    ReferenceIconTile(
-                        image = Icons.Outlined.Palette,
-                        tint = RecorderTheme.purple,
-                        tileSize = 42.dp,
-                        iconSize = 23.dp
-                    )
-                    Text("Color grading", color = RecorderTheme.textSecondary)
-                }
-                Text("${(options.colorGrading * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                Slider(
-                    value = options.colorGrading,
-                    onValueChange = { onOptionsChanged(options.copy(colorGrading = it)) },
-                    valueRange = 0f..1f
-                )
             }
         }
 
@@ -754,56 +760,21 @@ fun EffectsScreen(
         Button(
             onClick = onApplyPreview,
             enabled = videoUri != null && endMs > startMs &&
-                effectEndMs > effectStartMs && !isExporting,
+                sceneEffects.any {
+                    it.endMs > it.startMs && it.options.preset != VideoEffectPreset.NONE
+                } && !isExporting,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("Apply Effects to Preview")
+            Text("Preview Effects")
         }
         OutlinedButton(
             onClick = onExport,
             enabled = videoUri != null && endMs > startMs &&
-                effectEndMs > effectStartMs && !isExporting,
+                effectEndMs > effectStartMs && !isExporting && isPreviewApplied,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (isExporting) "Exporting…" else "Export MP4")
+            Text(if (isExporting) "Exporting…" else if (isPreviewApplied) "Export MP4" else "Preview before Export")
         }
-    }
-}
-
-@Composable
-private fun EffectSwitchRow(
-    title: String,
-    subtitle: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                ReferenceIconTile(
-                    image = icon,
-                    tint = RecorderTheme.purple,
-                    tileSize = 40.dp,
-                    iconSize = 22.dp
-                )
-                Text(title, color = RecorderTheme.textPrimary)
-            }
-            Text(
-                subtitle,
-                modifier = Modifier.padding(start = 48.dp),
-                color = RecorderTheme.textSecondary,
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
 
@@ -852,14 +823,15 @@ private fun VideoPreview(
     endMs: Long,
     onDurationChanged: (Long) -> Unit,
     videoEffects: List<Effect> = emptyList(),
-    slowMotionEnabled: Boolean = false,
-    slowMotionStartMs: Long = 0L,
-    slowMotionEndMs: Long = 0L,
-    slowMotionSpeed: Float = 1f,
+    slowMotionCues: List<SceneEffect> = emptyList(),
+    slowMotionOffsetMs: Long = 0L,
+    previewSeekMs: Long = startMs,
+    onPositionChanged: (Long) -> Unit = {},
     previewRequestId: Int = 0
 ) {
     val context = LocalContext.current
     val currentOnDurationChanged by rememberUpdatedState(onDurationChanged)
+    val currentOnPositionChanged by rememberUpdatedState(onPositionChanged)
     val player = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(Uri.parse(videoUri)))
@@ -870,11 +842,19 @@ private fun VideoPreview(
     var positionMs by remember(videoUri) { mutableLongStateOf(0L) }
     var playing by remember(videoUri) { mutableStateOf(false) }
     var appliedPlaybackSpeed by remember(player) { mutableFloatStateOf(1f) }
+    var videoAspectRatio by remember(videoUri) { mutableFloatStateOf(16f / 9f) }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 playing = isPlaying
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    videoAspectRatio =
+                        videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                }
             }
         }
         player.addListener(listener)
@@ -888,13 +868,12 @@ private fun VideoPreview(
         player,
         startMs,
         endMs,
-        slowMotionEnabled,
-        slowMotionStartMs,
-        slowMotionEndMs,
-        slowMotionSpeed
+        slowMotionCues,
+        slowMotionOffsetMs
     ) {
         while (true) {
             positionMs = player.currentPosition.coerceAtLeast(0L)
+            currentOnPositionChanged(positionMs)
             val playerDuration = player.duration
             if (playerDuration != C.TIME_UNSET && playerDuration > 0L && durationMs != playerDuration) {
                 durationMs = playerDuration
@@ -904,15 +883,13 @@ private fun VideoPreview(
                 player.pause()
                 player.seekTo(startMs)
             }
-            val desiredSpeed = if (
-                slowMotionEnabled &&
-                positionMs >= slowMotionStartMs &&
-                positionMs < slowMotionEndMs
-            ) {
-                slowMotionSpeed.coerceIn(0.25f, 0.9f)
-            } else {
-                1f
-            }
+            val desiredSpeed = slowMotionCues
+                .filter { it.options.usesSlowMotion() }
+                .filter { cue ->
+                    positionMs >= slowMotionOffsetMs + cue.startMs &&
+                        positionMs < slowMotionOffsetMs + cue.endMs
+                }
+                .minOfOrNull { it.options.slowMotionSpeed.coerceIn(0.25f, 0.9f) } ?: 1f
             if (desiredSpeed != appliedPlaybackSpeed) {
                 player.setPlaybackSpeed(desiredSpeed)
                 appliedPlaybackSpeed = desiredSpeed
@@ -924,7 +901,7 @@ private fun VideoPreview(
     LaunchedEffect(player, videoEffects, previewRequestId) {
         player.setVideoEffects(videoEffects)
         if (previewRequestId > 0) {
-            player.seekTo(slowMotionStartMs.coerceIn(startMs, endMs))
+            player.seekTo(previewSeekMs.coerceIn(startMs, endMs))
             player.play()
         }
     }
@@ -942,41 +919,45 @@ private fun VideoPreview(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(210.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(Color.Black)
-            ) {
-                AndroidView(
-                    modifier = Modifier.fillMaxWidth().height(210.dp),
-                    factory = { viewContext ->
-                        PlayerView(viewContext).apply {
-                            useController = false
-                            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                            setShutterBackgroundColor(android.graphics.Color.BLACK)
-                            this.player = player
-                        }
-                    },
-                    update = { it.player = player }
-                )
-                if (!playing) {
-                    IconButton(
-                        onClick = {
-                            if (player.currentPosition < startMs || player.currentPosition >= endMs) {
-                                player.seekTo(startMs)
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val previewHeight = (maxWidth.value / videoAspectRatio.coerceAtLeast(0.1f))
+                    .coerceIn(160f, 640f)
+                    .dp
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(previewHeight)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color.Black)
+                ) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxWidth().height(previewHeight),
+                        factory = { viewContext ->
+                            (android.view.LayoutInflater.from(viewContext)
+                                .inflate(com.mlbb.highlight.R.layout.editor_video_player, null) as PlayerView).apply {
+                                setShutterBackgroundColor(android.graphics.Color.BLACK)
+                                this.player = player
                             }
-                            player.play()
                         },
-                        modifier = Modifier.align(Alignment.Center)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.PlayArrow,
-                            contentDescription = "Play video",
-                            tint = Color.White,
-                            modifier = Modifier.size(54.dp)
-                        )
+                        update = { it.player = player }
+                    )
+                    if (!playing) {
+                        IconButton(
+                            onClick = {
+                                if (player.currentPosition < startMs || player.currentPosition >= endMs) {
+                                    player.seekTo(startMs)
+                                }
+                                player.play()
+                            },
+                            modifier = Modifier.align(Alignment.Center)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.PlayArrow,
+                                contentDescription = "Play video",
+                                tint = Color.White,
+                                modifier = Modifier.size(54.dp)
+                            )
+                        }
                     }
                 }
             }

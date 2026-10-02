@@ -10,11 +10,8 @@ import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Hd
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Language
-import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.RestartAlt
-import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.Speed
-import androidx.compose.material.icons.outlined.TouchApp
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material3.Card
@@ -23,7 +20,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -41,6 +37,8 @@ fun RecordingSettingsScreen(
     saveLocationLabel: String,
     appVersion: String,
     onChooseSaveLocation: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onPrepareFloatingRecorder: () -> Unit,
     onResetSettings: () -> Unit
 ) {
     Card(
@@ -116,45 +114,8 @@ fun RecordingSettingsScreen(
                 style = MaterialTheme.typography.bodySmall
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text("Voice commands", style = MaterialTheme.typography.titleMedium, color = RecorderTheme.textPrimary)
-                    Text(
-                        "Enable spoken Pause, Resume, and Stop commands from the recording notification.",
-                        color = RecorderTheme.textSecondary
-                    )
-                }
-                Switch(
-                    checked = settings.voiceCommandsEnabled,
-                    colors = androidx.compose.material3.SwitchDefaults.colors(
-                        checkedThumbColor = RecorderTheme.textPrimary,
-                        checkedTrackColor = RecorderTheme.blue
-                    ),
-                    onCheckedChange = { enabled ->
-                        onSettingsChange(settings.copy(voiceCommandsEnabled = enabled))
-                    }
-                )
-            }
-            if (settings.voiceCommandsEnabled) {
-                Text(
-                    "Voice recognition uses the microphone and can conflict with microphone audio recording.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
-
             androidx.compose.material3.HorizontalDivider(color = RecorderTheme.divider)
             SettingHeading("Editor and storage", Icons.Outlined.Tune, RecorderTheme.cyan)
-            SettingHeading("Output format", Icons.Outlined.Movie, RecorderTheme.green)
-            IconSettingRow(
-                icon = Icons.Outlined.Movie,
-                accent = RecorderTheme.green,
-                title = "MP4 video",
-                subtitle = "Compatible video format"
-            )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -171,40 +132,24 @@ fun RecordingSettingsScreen(
                     Text("Choose")
                 }
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                IconSettingRow(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Outlined.Save,
-                    accent = RecorderTheme.green,
-                    title = "Auto-save recordings and edits",
-                    subtitle = "Copy completed recordings and edits to the selected folder."
-                )
-                Switch(
-                    checked = settings.autoSave,
-                    onCheckedChange = { onSettingsChange(settings.copy(autoSave = it)) }
-                )
+            Text(
+                "Floating recorder controls require Android's display-over-other-apps permission. Tap the compact control to expand or collapse it; Android's secure-window flag excludes it from screen capture.",
+                color = RecorderTheme.textSecondary,
+                style = MaterialTheme.typography.bodySmall
+            )
+            androidx.compose.material3.TextButton(onClick = onRequestOverlayPermission) {
+                Text("Floating control permission")
             }
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+            Text(
+                "Prepare screen-capture permission here before leaving for MLBB. The floating Start button can then begin recording without reopening this screen.",
+                color = RecorderTheme.textSecondary,
+                style = MaterialTheme.typography.bodySmall
+            )
+            androidx.compose.material3.OutlinedButton(
+                onClick = onPrepareFloatingRecorder,
+                modifier = Modifier.fillMaxWidth()
             ) {
-                IconSettingRow(
-                    modifier = Modifier.weight(1f),
-                    icon = Icons.Outlined.TouchApp,
-                    accent = RecorderTheme.green,
-                    title = "Show touch indicators",
-                    subtitle = "Controlled by Android's system settings; this app cannot change it."
-                )
-                Switch(
-                    checked = false,
-                    enabled = false,
-                    onCheckedChange = {}
-                )
+                Text("Prepare floating recorder")
             }
             IconSettingRow(
                 icon = Icons.Outlined.Language,

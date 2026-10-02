@@ -6,26 +6,23 @@ An Android screen recorder for capturing complete Mobile Legends: Bang Bang game
 
 - Request Android screen-capture permission before recording.
 - Record the full screen to one MP4 in a foreground service.
+- Capture gameplay in landscape orientation at the selected 720p/1080p short edge.
+- Show movable, compact floating recorder controls while using other apps; the overlay window uses Android's secure-window flag so its content is excluded from screen capture.
 - Provide Pause/Resume and Stop actions in the persistent recording notification, without drawing controls over the gameplay capture.
 - Pause capture without adding the paused time to the resulting video's timeline.
 - Choose 720p or 1080p, 30 or 60 fps, and game/device audio, microphone, both, or silent before recording.
-- Optionally enable a Voice action in the notification for spoken Pause, Resume, and Stop commands.
 - Save and manage recordings in the app with play, delete, and share actions.
 - Import recordings or other videos, preview them, and trim a clip with draggable timeline handles.
-- Select a scene within the trimmed clip and apply Cinematic, Neon, Slow Motion, Flash, kill-moment slow motion, camera shake, intensity, and color grading to that scene before exporting an MP4.
+- In Effects, add scenes manually, then choose one effect per scene.
+- Preview the non-destructive edit before exporting. Adjust effect intensity and slow-motion speed when selected.
 - Use the Home dashboard to open Trim, Effects, and Settings, with Home, My Videos, and Profile in the bottom navigation.
 
 The recorder currently targets manual, full-session capture. Automatic event detection and replay highlights are not part of this workflow.
 
 ## Output Location
 
-The app keeps a private copy of recordings under its external files directory:
-
-```text
-Android/data/com.mlbb.highlight/files/Movies/Recordings/
-```
-
-When **Auto-save recordings and edits** is enabled and a save folder is selected in Settings, each completed recording and edited MP4 is also copied into that chosen folder. Videos remain listed in **My Videos**.
+Screen recordings are saved directly in the folder selected in Settings. The editor uses temporary app storage only while rendering an export:
+Choose a save folder in Settings before recording or exporting. Edits are staged temporarily for export and then saved there. The selected folder's videos appear in **My Videos**.
 
 ## Requirements
 
@@ -33,7 +30,7 @@ When **Auto-save recordings and edits** is enabled and a save folder is selected
 - JDK 17
 - Android device or emulator running Android 10 (API 29) or newer
 
-Each recording requires Android MediaProjection consent. Audio or voice commands require microphone permission. 720p/1080p refer to the shorter video edge, with the full screen aspect ratio preserved. Android may prevent capture of audio from apps that disallow playback capture. When game audio is silent, try Microphone or Game audio + microphone. Voice commands open Android's speech recognizer from the recording notification; they are not always listening. The editor preserves audio present in the selected source clip.
+Each recording requires Android MediaProjection consent. The floating controls also require Android's **Display over other apps** permission; the app requests this on first launch. Start from the floating button opens the system capture-consent prompt before recording begins. Selecting microphone audio requires microphone permission. 720p/1080p refer to the shorter landscape video edge. Android may prevent capture of audio from apps that disallow playback capture. When game audio is silent, try Microphone or Game audio + microphone. The editor preserves audio present in the selected source clip.
 
 ## Build
 
@@ -54,10 +51,10 @@ app/build/outputs/apk/debug/app-debug.apk
 1. Open the project in Android Studio.
 2. Connect an Android device or start an emulator.
 3. Install and launch the debug app.
-4. Choose resolution, frame rate, and audio settings before starting. Grant any requested microphone permission and approve Android's screen-capture prompt.
-5. While playing, open the recording notification to choose **Pause/Resume** or **Stop**. **Voice** appears there when enabled in settings.
-6. Find completed MP4 files in **My Videos** from Home; play, delete, or share them there.
-7. To edit, open **Trim**, choose a video from the device or select a recording from **MLBB Gallery**. Scrub the preview and drag the timeline handles to set the clip range, continue to **Effects**, and drag the Effect Scene handles to select where the enabled effects should apply. Tap **Apply Effects to Preview** to audition the visual effects and scene-local slow motion in the player; this does not create or save a video. Slow motion extends the selected scene's playback time (a 50% speed setting doubles that scene's duration); if the entire trimmed clip is selected, the entire clip will be slowed. Tap **Export MP4** separately when you want to save the result. Exports appear in **My Videos** and are copied to the selected folder when auto-save is enabled. App recordings may not appear in Android's external file picker because they are kept in the app's private folder; use **MLBB Gallery** instead.
+4. Grant the **Display over other apps** permission so the floating recorder controls can appear above gameplay.
+5. Choose a save folder, resolution, frame rate, and audio settings before recording. Tap the compact floating control to expand it, tap **Start**, and approve Android's screen-capture prompt.
+6. Keep the controls expanded or collapse them back to the compact button while recording. **Pause/Resume** and **Stop** remain available in the expanded overlay; **Stop** finishes and saves the video. The overlay uses `FLAG_SECURE` and is excluded from the captured video. The recording notification also provides **Pause/Resume** and **Stop**.
+7. Find completed MP4 files in **My Videos**; tap a video to play, or delete/share it. To edit, open **Trim**, choose a video, and set the clip range. In **Effects**, use **Select Scene**, choose an effect, preview the edit, then export. Exports appear in the selected folder and **My Videos**. The editor uses temporary app storage while an export is being rendered.
 
 ## Architecture
 
@@ -66,7 +63,9 @@ app/build/outputs/apk/debug/app-debug.apk
 - MediaCodec surface video encoder and MediaMuxer
 - AAC audio encoding for selected playback and/or microphone input
 - AndroidX Media3 ExoPlayer preview and Transformer MP4 export
+- Modular, timestamped scene effects and manual scene selection
 - Recording notification controls
+- Secure floating capture controls
 - FileProvider for local recording playback and sharing
 
 ## Limitations and Future Work
@@ -74,8 +73,9 @@ app/build/outputs/apk/debug/app-debug.apk
 - Actual frame rate and maximum resolution depend on the device's display and encoder capabilities.
 - Game audio capture is subject to the source app's Android playback-capture policy.
 - Kill shake is a visual camera-shake effect rendered into the selected scene; it does not vibrate the phone.
-- Touch indicators are controlled by Android system settings and cannot be toggled by this app. English is currently the only app language.
-- Voice recognition depends on an installed Android speech-recognition service and may compete with microphone capture.
+- English is currently the only app language.
+- Scene selection in the Effects editor is manual.
+- Visual effects are silent overlays/transforms; no separate impact sound effect is currently added.
 - Validate long-session stability, audio/video synchronization, and output playback across devices.
 - Revisit replay highlights and OCR/event detection if the product direction changes
 

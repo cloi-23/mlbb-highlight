@@ -15,27 +15,28 @@ import android.hardware.display.VirtualDisplay
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
-import android.os.Environment
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.mlbb.highlight.MainActivity
 import com.mlbb.highlight.R
-import com.mlbb.highlight.recording.VoiceCommandActivity
 import com.mlbb.highlight.settings.AppSettings
 import com.mlbb.highlight.settings.RecordingAudioSource
 import com.mlbb.highlight.storage.HighlightRepository
-import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 class ScreenCaptureService : Service() {
-    private lateinit var recordingDirectory: File
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var screenRecorder: ScreenRecorder? = null
+    private var recordingDescriptor: ParcelFileDescriptor? = null
+    private var recordingDocumentUri: Uri? = null
+    private var recordingDisplayName: String? = null
     private var recordingSettings = AppSettings()
     private var isReleasing = false
 
@@ -47,8 +48,6 @@ class ScreenCaptureService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        recordingDirectory = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "Recordings")
-        recordingDirectory.mkdirs()
         createNotificationChannel()
     }
 
@@ -61,20 +60,13 @@ class ScreenCaptureService : Service() {
                 }
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 val resultData = intent.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
-                recordingSettings = AppSettings(
-                    resolutionShortEdge = intent.getIntExtra(
-                        EXTRA_RESOLUTION_SHORT_EDGE,
-                        AppSettings().resolutionShortEdge
-                    ),
-                    frameRate = intent.getIntExtra(EXTRA_FRAME_RATE, AppSettings().frameRate),
-                    audioSource = intent.getStringExtra(EXTRA_AUDIO_SOURCE)
-                        ?.let { value -> RecordingAudioSource.entries.firstOrNull { it.name == value } }
-                        ?: AppSettings().audioSource,
-                    voiceCommandsEnabled = intent.getBooleanExtra(EXTRA_VOICE_COMMANDS_ENABLED, false),
-                    saveLocationUri = intent.getStringExtra(EXTRA_SAVE_LOCATION_URI),
-                    autoSave = intent.getBooleanExtra(EXTRA_AUTO_SAVE, true)
-                )
+                recordingSettings = intent.toRecordingSettings()
 
+                if (recordingSettings.saveLocationUri == null) {
+                    sendCaptureStatus(errorMessage = "Choose a gallery save folder in Settings before recording")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 if (resultCode != Activity.RESULT_OK || resultData == null) {
                     stopSelf()
                     return START_NOT_STICKY
@@ -82,6 +74,34 @@ class ScreenCaptureService : Service() {
 
                 startForegroundForProjection()
                 startProjection(resultCode, resultData)
+            }
+
+            ACTION_PREPARE -> {
+                if (isReleasing || mediaProjection != null) return START_NOT_STICKY
+                recordingSettings = intent.toRecordingSettings()
+                if (recordingSettings.saveLocationUri == null) {
+                    sendCaptureStatus(errorMessage = "Choose a gallery save folder in Settings before recording")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val resultData = intent.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
+                if (resultCode != Activity.RESULT_OK || resultData == null) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                startForegroundForProjection()
+                prepareProjection(resultCode, resultData)
+            }
+
+            ACTION_START_PREPARED -> {
+                val projection = mediaProjection
+                if (projection == null || !isProjectionReady) {
+                    sendCaptureStatus(errorMessage = "Open the recorder and prepare floating capture first")
+                    return START_NOT_STICKY
+                }
+                if (isReleasing || isCapturing) return START_NOT_STICKY
+                startPreparedRecording(projection)
             }
 
             ACTION_STOP -> {
@@ -92,8 +112,10 @@ class ScreenCaptureService : Service() {
                 togglePause()
             }
 
-            ACTION_VOICE_COMMAND -> {
-                handleVoiceCommand(intent.getStringExtra(EXTRA_VOICE_COMMAND))
+            ACTION_CANCEL_PREPARED -> {
+                if (!isCapturing && mediaProjection != null) {
+                    releaseCapture(stopProjection = true)
+                }
             }
         }
 
@@ -121,10 +143,40 @@ class ScreenCaptureService : Service() {
         }
 
         mediaProjection = projection
+        isProjectionReady = true
         isCapturing = true
         isPaused = false
         sendCaptureStatus()
         projection.registerCallback(projectionCallback, null)
+        try {
+            createVirtualDisplay(projection)
+        } catch (error: Exception) {
+            releaseCapture(stopProjection = true)
+            sendCaptureStatus(errorMessage = error.message ?: "Could not start recording with these settings")
+        }
+    }
+
+    private fun prepareProjection(resultCode: Int, resultData: Intent) {
+        val projection = getSystemService(MediaProjectionManager::class.java)
+            .getMediaProjection(resultCode, resultData)
+        if (projection == null) {
+            sendCaptureStatus(errorMessage = "Screen-capture permission could not be prepared")
+            stopSelf()
+            return
+        }
+        mediaProjection = projection
+        isProjectionReady = true
+        isCapturing = false
+        isPaused = false
+        projection.registerCallback(projectionCallback, null)
+        sendCaptureStatus()
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
+    }
+
+    private fun startPreparedRecording(projection: MediaProjection) {
+        isCapturing = true
+        isPaused = false
+        sendCaptureStatus()
         try {
             createVirtualDisplay(projection)
         } catch (error: Exception) {
@@ -149,16 +201,47 @@ class ScreenCaptureService : Service() {
     }
 
     private fun startSegmentCapture(projection: MediaProjection, size: RecordingSize, densityDpi: Int) {
-        recordingDirectory.mkdirs()
-        val recorder = ScreenRecorder(
-            this,
-            size.width,
-            size.height,
-            createRecordingFile(),
-            recordingSettings.frameRate,
-            recordingSettings.audioSource,
-            projection
-        )
+        val folderUri = Uri.parse(checkNotNull(recordingSettings.saveLocationUri))
+        val repository = HighlightRepository(this)
+        val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss_SSS", Locale.US).format(Date())
+        val displayName = "recording_$timestamp.mp4"
+        val documentUri = repository.createVideoDocument(folderUri, displayName)
+        val descriptor = try {
+            contentResolver.openFileDescriptor(documentUri, "rwt")
+                ?: throw IOException("Android could not open the selected gallery video")
+        } catch (error: IOException) {
+            deleteIncompleteVideo(documentUri, error)
+            throw error
+        } catch (error: SecurityException) {
+            deleteIncompleteVideo(documentUri, error)
+            throw error
+        } catch (error: IllegalArgumentException) {
+            deleteIncompleteVideo(documentUri, error)
+            throw error
+        }
+        val recorder = try {
+            ScreenRecorder(
+                this,
+                size.width,
+                size.height,
+                outputFile = null,
+                frameRate = recordingSettings.frameRate,
+                audioSource = recordingSettings.audioSource,
+                projection = projection,
+                outputFileDescriptor = descriptor.fileDescriptor
+            )
+        } catch (error: RuntimeException) {
+            try {
+                descriptor.close()
+            } catch (closeError: IOException) {
+                error.addSuppressed(closeError)
+            }
+            deleteIncompleteVideo(documentUri, error)
+            throw error
+        }
+        recordingDocumentUri = documentUri
+        recordingDescriptor = descriptor
+        recordingDisplayName = displayName
         screenRecorder = recorder
 
         virtualDisplay = projection.createVirtualDisplay(
@@ -179,6 +262,7 @@ class ScreenCaptureService : Service() {
 
         isCapturing = false
         isPaused = false
+        isProjectionReady = false
         sendCaptureStatus()
 
         val display = virtualDisplay
@@ -191,41 +275,64 @@ class ScreenCaptureService : Service() {
 
         val recorder = screenRecorder
         screenRecorder = null
+        val outputDescriptor = recordingDescriptor
+        recordingDescriptor = null
+        val outputDocumentUri = recordingDocumentUri
+        recordingDocumentUri = null
+        val displayName = recordingDisplayName
+        recordingDisplayName = null
 
         Thread {
-            var savedFile: File? = null
+            var savedUri: Uri? = null
             val statusMessages = mutableListOf<String>()
             if (recorder != null) {
                 try {
-                    savedFile = saveRecording(recorder)
+                    recorder.stop()
+                    outputDescriptor?.close()
+                    val size = outputDocumentUri?.let { uri ->
+                        contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize }
+                    } ?: 0L
+                    if (size > 0L) {
+                        savedUri = outputDocumentUri
+                    } else {
+                        statusMessages += "The recording was empty and was not saved"
+                    }
                 } catch (error: IllegalStateException) {
                     statusMessages += error.message ?: "Recording could not be finalized"
+                } catch (error: IOException) {
+                    statusMessages += error.message ?: "Recording could not be saved to the selected folder"
+                } catch (error: RuntimeException) {
+                    statusMessages += error.localizedMessage ?: "Recording could not be finalized"
+                } finally {
+                    try {
+                        outputDescriptor?.close()
+                    } catch (error: IOException) {
+                        statusMessages += error.message ?: "Could not close the recording file"
+                    }
+                }
+            }
+            if (savedUri == null && outputDocumentUri != null) {
+                try {
+                    if (!DocumentsContract.deleteDocument(contentResolver, outputDocumentUri)) {
+                        statusMessages += "Could not remove the incomplete video from the selected folder"
+                    }
+                } catch (error: IOException) {
+                    statusMessages += error.message ?: "Could not remove the incomplete video"
+                } catch (error: SecurityException) {
+                    statusMessages += "Android denied access to remove the incomplete video"
+                } catch (error: IllegalArgumentException) {
+                    statusMessages += "The incomplete video could not be found for cleanup"
                 }
             }
             display?.release()
             if (stopProjection) {
                 projection?.stop()
             }
-            if (savedFile != null) {
-                if (recordingSettings.autoSave && recordingSettings.saveLocationUri != null) {
-                    try {
-                        HighlightRepository(this).copyToFolderTree(
-                            savedFile,
-                            Uri.parse(recordingSettings.saveLocationUri)
-                        )
-                    } catch (error: IOException) {
-                        statusMessages +=
-                            "Recording saved in My Videos, but copying to the selected folder failed: " +
-                                (error.localizedMessage ?: "storage error")
-                    } catch (error: SecurityException) {
-                        statusMessages +=
-                            "Recording saved in My Videos, but Android denied access to the selected folder"
-                    } catch (error: IllegalArgumentException) {
-                        statusMessages +=
-                            "Recording saved in My Videos, but the selected folder is no longer available"
-                    }
-                }
-                showRecordingSavedNotification(savedFile)
+            if (savedUri != null) {
+                showRecordingSavedNotification(
+                    savedUri,
+                    displayName ?: "Recording saved"
+                )
             }
             if (
                 recorder != null &&
@@ -238,9 +345,9 @@ class ScreenCaptureService : Service() {
             stopForeground(STOP_FOREGROUND_REMOVE)
             isReleasing = false
             sendCaptureStatus(
-                recordingFile = savedFile,
+                recordingUri = savedUri,
                 errorMessage = statusMessages.takeIf { it.isNotEmpty() }?.joinToString("\n")
-                    ?: if (savedFile == null && recorder != null) {
+                    ?: if (savedUri == null && recorder != null) {
                     "Recording could not be saved"
                 } else null
             )
@@ -250,25 +357,15 @@ class ScreenCaptureService : Service() {
         }.start()
     }
 
-    private fun saveRecording(recorder: ScreenRecorder): File? {
-        val output = recorder.stop()
-        return output.takeIf { it.isFile && it.length() > 0L }
-    }
-
-    private fun launchVoiceCommand() {
-        if (!recordingSettings.voiceCommandsEnabled) return
-        startActivity(
-            Intent(this, VoiceCommandActivity::class.java)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        )
-    }
-
-    private fun handleVoiceCommand(command: String?) {
-        when (command?.trim()?.lowercase(Locale.ROOT)) {
-            "pause", "pause recording", "pause the recording" -> if (!isPaused) togglePause()
-            "resume", "resume recording", "continue recording" -> if (isPaused) togglePause()
-            "stop", "stop recording", "finish recording" -> releaseCapture(stopProjection = true)
-            else -> sendCaptureStatus(errorMessage = "Command not recognized. Say Pause, Resume, or Stop.")
+    private fun deleteIncompleteVideo(uri: Uri, originalError: Exception) {
+        try {
+            DocumentsContract.deleteDocument(contentResolver, uri)
+        } catch (error: IOException) {
+            originalError.addSuppressed(error)
+        } catch (error: SecurityException) {
+            originalError.addSuppressed(error)
+        } catch (error: IllegalArgumentException) {
+            originalError.addSuppressed(error)
         }
     }
 
@@ -296,11 +393,12 @@ class ScreenCaptureService : Service() {
         screenHeight: Int,
         requestedShortEdge: Int
     ): RecordingSize {
+        val longEdge = screenWidth.coerceAtLeast(screenHeight)
         val shortEdge = screenWidth.coerceAtMost(screenHeight)
         val scale = (requestedShortEdge.toFloat() / shortEdge).coerceAtMost(1f)
-        val width = makeEven((screenWidth * scale).toInt().coerceAtLeast(2))
-        val height = makeEven((screenHeight * scale).toInt().coerceAtLeast(2))
-        return RecordingSize(width, height)
+        val landscapeWidth = makeEven((longEdge * scale).toInt().coerceAtLeast(2))
+        val landscapeHeight = makeEven((shortEdge * scale).toInt().coerceAtLeast(2))
+        return RecordingSize(landscapeWidth, landscapeHeight)
     }
 
     private fun makeEven(value: Int): Int {
@@ -308,7 +406,6 @@ class ScreenCaptureService : Service() {
     }
 
     private fun sendCaptureStatus(
-        recordingFile: File? = null,
         recordingUri: android.net.Uri? = null,
         errorMessage: String? = null
     ) {
@@ -317,18 +414,13 @@ class ScreenCaptureService : Service() {
                 .setPackage(packageName)
                 .putExtra(EXTRA_IS_CAPTURING, isCapturing)
                 .putExtra(EXTRA_IS_PAUSED, isPaused)
+                .putExtra(EXTRA_IS_PREPARED, isProjectionReady)
                 .putExtra(EXTRA_RECORDING_URI, recordingUri?.toString())
-                .putExtra(EXTRA_RECORDING_PATH, recordingFile?.absolutePath)
                 .putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
         )
     }
 
-    private fun showRecordingSavedNotification(recordingFile: File) {
-        val uri = androidx.core.content.FileProvider.getUriForFile(
-            this,
-            "$packageName.fileprovider",
-            recordingFile
-        )
+    private fun showRecordingSavedNotification(uri: Uri, fileName: String) {
         val viewIntent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, "video/mp4")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -337,7 +429,7 @@ class ScreenCaptureService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_screen_capture)
             .setContentTitle("Recording saved")
-            .setContentText(recordingFile.name)
+            .setContentText(fileName)
             .setContentIntent(
                 PendingIntent.getActivity(
                     this,
@@ -353,19 +445,13 @@ class ScreenCaptureService : Service() {
         getSystemService(NotificationManager::class.java).notify(RECORDING_SAVED_NOTIFICATION_ID, notification)
     }
 
-    private fun createRecordingFile(): File {
-        val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss_SSS", Locale.US).format(Date())
-        return File(recordingDirectory, "recording_$timestamp.mp4")
-    }
-
     private fun startForegroundForProjection() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val serviceTypes = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or
                 if (
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                     (recordingSettings.audioSource == RecordingAudioSource.MICROPHONE ||
-                        recordingSettings.audioSource == RecordingAudioSource.DEVICE_AND_MICROPHONE ||
-                        recordingSettings.voiceCommandsEnabled)
+                        recordingSettings.audioSource == RecordingAudioSource.DEVICE_AND_MICROPHONE)
                 ) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 } else {
@@ -387,7 +473,14 @@ class ScreenCaptureService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_screen_capture)
             .setContentTitle("MLBB Gameplay Recorder")
-            .setContentText(if (isPaused) "Recording is paused" else "Screen recording is running")
+            .setContentText(
+                when {
+                    isPaused -> "Recording is paused"
+                    isCapturing -> "Screen recording is running"
+                    isProjectionReady -> "Floating recorder is ready"
+                    else -> "Screen recorder is ready"
+                }
+            )
             .setContentIntent(
                 PendingIntent.getActivity(
                     this,
@@ -416,20 +509,6 @@ class ScreenCaptureService : Service() {
                     PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                 )
             )
-            .apply {
-                if (recordingSettings.voiceCommandsEnabled) {
-                    addAction(
-                        0,
-                        "Voice",
-                        PendingIntent.getActivity(
-                            this@ScreenCaptureService,
-                            VOICE_ACTION_REQUEST_CODE,
-                            Intent(this@ScreenCaptureService, VoiceCommandActivity::class.java),
-                            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-                        )
-                    )
-                }
-            }
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .build()
@@ -459,27 +538,25 @@ class ScreenCaptureService : Service() {
         private const val RECORDING_SAVED_NOTIFICATION_ID = 1003
         private const val PAUSE_ACTION_REQUEST_CODE = 1004
         private const val STOP_ACTION_REQUEST_CODE = 1005
-        private const val VOICE_ACTION_REQUEST_CODE = 1006
         private const val VIRTUAL_DISPLAY_NAME = "MLBBHighlightCapture"
         private const val EXTRA_RESULT_CODE = "extra_result_code"
         private const val EXTRA_RESULT_DATA = "extra_result_data"
         private const val EXTRA_RESOLUTION_SHORT_EDGE = "extra_resolution_short_edge"
         private const val EXTRA_FRAME_RATE = "extra_frame_rate"
         private const val EXTRA_AUDIO_SOURCE = "extra_audio_source"
-        private const val EXTRA_VOICE_COMMANDS_ENABLED = "extra_voice_commands_enabled"
         private const val EXTRA_SAVE_LOCATION_URI = "extra_save_location_uri"
-        private const val EXTRA_AUTO_SAVE = "extra_auto_save"
-        const val EXTRA_VOICE_COMMAND = "extra_voice_command"
         const val EXTRA_IS_CAPTURING = "extra_is_capturing"
         const val EXTRA_IS_PAUSED = "extra_is_paused"
+        const val EXTRA_IS_PREPARED = "extra_is_prepared"
         const val EXTRA_ERROR_MESSAGE = "extra_error_message"
         const val EXTRA_RECORDING_URI = "extra_recording_uri"
-        const val EXTRA_RECORDING_PATH = "extra_recording_path"
 
         const val ACTION_START = "com.mlbb.highlight.recording.action.START"
         const val ACTION_STOP = "com.mlbb.highlight.recording.action.STOP"
         const val ACTION_PAUSE_RESUME = "com.mlbb.highlight.recording.action.PAUSE_RESUME"
-        const val ACTION_VOICE_COMMAND = "com.mlbb.highlight.recording.action.VOICE_COMMAND"
+        const val ACTION_PREPARE = "com.mlbb.highlight.recording.action.PREPARE"
+        const val ACTION_START_PREPARED = "com.mlbb.highlight.recording.action.START_PREPARED"
+        const val ACTION_CANCEL_PREPARED = "com.mlbb.highlight.recording.action.CANCEL_PREPARED"
         const val ACTION_STATUS_CHANGED = "com.mlbb.highlight.recording.action.STATUS_CHANGED"
 
         @Volatile
@@ -487,6 +564,9 @@ class ScreenCaptureService : Service() {
             private set
         @Volatile
         var isPaused: Boolean = false
+            private set
+        @Volatile
+        var isProjectionReady: Boolean = false
             private set
 
         fun setCapturing(value: Boolean) {
@@ -506,11 +586,30 @@ class ScreenCaptureService : Service() {
                 putExtra(EXTRA_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
                 putExtra(EXTRA_FRAME_RATE, settings.frameRate)
                 putExtra(EXTRA_AUDIO_SOURCE, settings.audioSource.name)
-                putExtra(EXTRA_VOICE_COMMANDS_ENABLED, settings.voiceCommandsEnabled)
                 putExtra(EXTRA_SAVE_LOCATION_URI, settings.saveLocationUri)
-                putExtra(EXTRA_AUTO_SAVE, settings.autoSave)
             }
         }
+
+        fun prepareIntent(
+            context: Context,
+            resultCode: Int,
+            resultData: Intent,
+            settings: AppSettings
+        ): Intent = Intent(context, ScreenCaptureService::class.java).apply {
+            action = ACTION_PREPARE
+            putExtra(EXTRA_RESULT_CODE, resultCode)
+            putExtra(EXTRA_RESULT_DATA, resultData)
+            putExtra(EXTRA_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
+            putExtra(EXTRA_FRAME_RATE, settings.frameRate)
+            putExtra(EXTRA_AUDIO_SOURCE, settings.audioSource.name)
+            putExtra(EXTRA_SAVE_LOCATION_URI, settings.saveLocationUri)
+        }
+
+        fun startPreparedIntent(context: Context): Intent =
+            Intent(context, ScreenCaptureService::class.java).setAction(ACTION_START_PREPARED)
+
+        fun cancelPreparedIntent(context: Context): Intent =
+            Intent(context, ScreenCaptureService::class.java).setAction(ACTION_CANCEL_PREPARED)
 
         fun stopIntent(context: Context): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
@@ -524,16 +623,22 @@ class ScreenCaptureService : Service() {
             }
         }
 
-        fun voiceCommandIntent(context: Context, command: String): Intent {
-            return Intent(context, ScreenCaptureService::class.java).apply {
-                action = ACTION_VOICE_COMMAND
-                putExtra(EXTRA_VOICE_COMMAND, command)
-            }
-        }
     }
 
     private data class RecordingSize(
         val width: Int,
         val height: Int
+    )
+
+    private fun Intent.toRecordingSettings() = AppSettings(
+        resolutionShortEdge = getIntExtra(
+            EXTRA_RESOLUTION_SHORT_EDGE,
+            AppSettings().resolutionShortEdge
+        ),
+        frameRate = getIntExtra(EXTRA_FRAME_RATE, AppSettings().frameRate),
+        audioSource = getStringExtra(EXTRA_AUDIO_SOURCE)
+            ?.let { value -> RecordingAudioSource.entries.firstOrNull { it.name == value } }
+            ?: AppSettings().audioSource,
+        saveLocationUri = getStringExtra(EXTRA_SAVE_LOCATION_URI)
     )
 }

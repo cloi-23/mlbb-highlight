@@ -11,6 +11,7 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import java.io.File
 import java.io.IOException
 import androidx.activity.ComponentActivity
@@ -61,6 +62,7 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import com.mlbb.highlight.recording.ScreenCaptureService
+import com.mlbb.highlight.recording.FloatingControlService
 import com.mlbb.highlight.settings.AppSettings
 import com.mlbb.highlight.settings.RecordingAudioSource
 import com.mlbb.highlight.settings.SettingsRepository
@@ -75,11 +77,41 @@ import com.mlbb.highlight.ui.EffectsScreen
 import com.mlbb.highlight.ui.TrimScreen
 import com.mlbb.highlight.ui.VideoEffectOptions
 import com.mlbb.highlight.ui.VideoEffectPreset
+import com.mlbb.highlight.ui.SceneEffect
+import com.mlbb.highlight.ui.usesSlowMotion
 import com.mlbb.highlight.ui.createSceneVideoEffects
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicReference
 
 class MainActivity : ComponentActivity() {
+    private var overlayPermissionRequested = false
+
+    override fun onResume() {
+        super.onResume()
+        if (Settings.canDrawOverlays(this)) {
+            ContextCompat.startForegroundService(
+                this,
+                FloatingControlService.startIntent(this)
+            )
+        } else if (!overlayPermissionRequested) {
+            overlayPermissionRequested = true
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
+                )
+            )
+        }
+    }
+
+    private fun videoUriFor(location: String): Uri {
+        val uri = Uri.parse(location)
+        if (uri.scheme == "content") return uri
+        val file = File(location)
+        require(file.isFile && file.length() > 0L) { "Video file is missing or empty" }
+        return FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -107,11 +139,21 @@ class MainActivity : ComponentActivity() {
                     var shouldStartAfterAudioPermission by rememberSaveable {
                         mutableStateOf(false)
                     }
-                    var highlights by remember { mutableStateOf(highlightRepository.listHighlights()) }
+                    var shouldPrepareFloatingRecorder by rememberSaveable {
+                        mutableStateOf(false)
+                    }
+                    var highlights by remember {
+                        mutableStateOf(
+                            highlightRepository.listHighlights(settings.saveLocationUri?.let(Uri::parse))
+                        )
+                    }
                     var selectedDestination by rememberSaveable {
                         mutableStateOf(RecorderDestination.HOME.name)
                     }
                     var showVideos by rememberSaveable { mutableStateOf(false) }
+                    var videoLibraryMessage by rememberSaveable { mutableStateOf<String?>(null) }
+                    var playbackVideoUri by rememberSaveable { mutableStateOf<String?>(null) }
+                    var playbackVideoTitle by rememberSaveable { mutableStateOf("") }
                     var selectedVideoUri by rememberSaveable { mutableStateOf<String?>(null) }
                     var trimStartMs by rememberSaveable { mutableStateOf(0L) }
                     var trimEndMs by rememberSaveable { mutableStateOf(0L) }
@@ -119,9 +161,10 @@ class MainActivity : ComponentActivity() {
                     var effectStartMs by rememberSaveable { mutableStateOf(0L) }
                     var effectEndMs by rememberSaveable { mutableStateOf(0L) }
                     var effectOptions by remember { mutableStateOf(VideoEffectOptions()) }
-                    var appliedEffectOptions by remember { mutableStateOf(VideoEffectOptions()) }
-                    var appliedEffectStartMs by rememberSaveable { mutableStateOf(0L) }
-                    var appliedEffectEndMs by rememberSaveable { mutableStateOf(0L) }
+                    var sceneEffects by remember { mutableStateOf(emptyList<SceneEffect>()) }
+                    var appliedSceneEffects by remember { mutableStateOf(emptyList<SceneEffect>()) }
+                    var selectedSceneId by rememberSaveable { mutableStateOf("") }
+                    var playheadMs by rememberSaveable { mutableStateOf(0L) }
                     var isEffectPreviewApplied by rememberSaveable { mutableStateOf(false) }
                     var previewRequestId by rememberSaveable { mutableStateOf(0) }
                     var isExporting by remember { mutableStateOf(false) }
@@ -150,9 +193,10 @@ class MainActivity : ComponentActivity() {
                             effectStartMs = 0L
                             effectEndMs = 0L
                             effectOptions = VideoEffectOptions()
-                            appliedEffectOptions = VideoEffectOptions()
-                            appliedEffectStartMs = 0L
-                            appliedEffectEndMs = 0L
+                            sceneEffects = emptyList()
+                            appliedSceneEffects = emptyList()
+                            selectedSceneId = ""
+                            playheadMs = 0L
                             isEffectPreviewApplied = false
                             exportMessage = null
                         }
@@ -169,6 +213,7 @@ class MainActivity : ComponentActivity() {
                                 val updated = settings.copy(saveLocationUri = uri.toString())
                                 settings = updated
                                 settingsRepository.save(updated)
+                                highlights = highlightRepository.listHighlights(uri)
                             } catch (exception: SecurityException) {
                                 statusMessage = "Android did not grant access to that folder"
                             }
@@ -183,9 +228,10 @@ class MainActivity : ComponentActivity() {
                         effectStartMs = 0L
                         effectEndMs = 0L
                         effectOptions = VideoEffectOptions()
-                        appliedEffectOptions = VideoEffectOptions()
-                        appliedEffectStartMs = 0L
-                        appliedEffectEndMs = 0L
+                        sceneEffects = emptyList()
+                        appliedSceneEffects = emptyList()
+                        selectedSceneId = ""
+                        playheadMs = 0L
                         isEffectPreviewApplied = false
                         exportMessage = null
                     }
@@ -193,29 +239,40 @@ class MainActivity : ComponentActivity() {
                     fun startExport() {
                         val inputUri = selectedVideoUri?.let(Uri::parse)
                         val clipDurationMs = trimEndMs - trimStartMs
-                        val safeEffectStartMs = effectStartMs.coerceIn(0L, clipDurationMs)
-                        val safeEffectEndMs = effectEndMs.coerceIn(safeEffectStartMs, clipDurationMs)
+                        val exportScenes = appliedSceneEffects.filter {
+                            it.endMs > it.startMs && it.options.preset != VideoEffectPreset.NONE
+                        }.map { scene ->
+                            scene.copy(
+                                startMs = scene.startMs.coerceIn(0L, clipDurationMs),
+                                endMs = scene.endMs.coerceIn(0L, clipDurationMs)
+                            )
+                        }.filter { it.endMs > it.startMs }
                         if (
                             inputUri == null ||
                             trimEndMs <= trimStartMs ||
-                            safeEffectEndMs <= safeEffectStartMs ||
+                            settings.saveLocationUri == null ||
+                            exportScenes.isEmpty() ||
+                            !isEffectPreviewApplied ||
                             isExporting
                         ) {
-                            exportMessage = "Choose a video and set a valid trim range before exporting"
+                            exportMessage = if (settings.saveLocationUri == null) {
+                                "Choose a gallery folder in Settings before exporting"
+                            } else {
+                                "Preview a scene effect before exporting"
+                            }
                             return
                         }
 
                         val outputFile = highlightRepository.createEditedOutputFile()
-                        val sceneStartUs = safeEffectStartMs * 1_000L
-                        val sceneEndUs = safeEffectEndMs * 1_000L
-                        val sceneEffects = createSceneVideoEffects(
-                            effectOptions,
-                            sceneStartUs,
-                            sceneEndUs
-                        )
-                        val wantsSlowMotion =
-                            effectOptions.slowMotionEnabled ||
-                                effectOptions.preset == VideoEffectPreset.SLOW_MOTION
+                        val videoEffects = exportScenes.flatMap { scene ->
+                            createSceneVideoEffects(
+                                scene.options,
+                                scene.startMs * 1_000L,
+                                scene.endMs * 1_000L,
+                                (scene.eventTimeMs ?: (scene.startMs + 200L)) * 1_000L
+                            )
+                        }
+                        val slowMotionScenes = exportScenes.filter { it.options.usesSlowMotion() }
                         val mediaItem = MediaItem.Builder()
                             .setUri(inputUri)
                             .setClippingConfiguration(
@@ -226,22 +283,21 @@ class MainActivity : ComponentActivity() {
                             )
                             .build()
                         val editedItemBuilder = EditedMediaItem.Builder(mediaItem)
-                            .setEffects(Effects(emptyList(), sceneEffects))
-                        if (wantsSlowMotion) {
-                            val speed = effectOptions.slowMotionSpeed.coerceIn(0.25f, 0.9f)
+                            .setEffects(Effects(emptyList(), videoEffects))
+                        if (slowMotionScenes.isNotEmpty()) {
                             editedItemBuilder.setSpeed(
                                 object : SpeedProvider {
-                                    override fun getSpeed(timeUs: Long): Float = when {
-                                        timeUs < sceneStartUs -> 1f
-                                        timeUs < sceneEndUs -> speed
-                                        else -> 1f
-                                    }
+                                    override fun getSpeed(timeUs: Long): Float =
+                                        slowMotionScenes
+                                            .filter { timeUs >= it.startMs * 1_000L && timeUs < it.endMs * 1_000L }
+                                            .minOfOrNull { it.options.slowMotionSpeed.coerceIn(0.25f, 0.9f) }
+                                            ?: 1f
 
-                                    override fun getNextSpeedChangeTimeUs(timeUs: Long): Long = when {
-                                        timeUs < sceneStartUs -> sceneStartUs
-                                        timeUs < sceneEndUs -> sceneEndUs
-                                        else -> C.TIME_UNSET
-                                    }
+                                    override fun getNextSpeedChangeTimeUs(timeUs: Long): Long =
+                                        slowMotionScenes
+                                            .flatMap { listOf(it.startMs * 1_000L, it.endMs * 1_000L) }
+                                            .filter { it > timeUs }
+                                            .minOrNull() ?: C.TIME_UNSET
                                 }
                             )
                         }
@@ -263,26 +319,32 @@ class MainActivity : ComponentActivity() {
                                             exportMessage = "Export finished without a playable output file"
                                             return
                                         }
-                                        highlights = highlightRepository.listHighlights()
-                                        exportMessage = "Export saved to My Videos"
-                                        if (settings.autoSave && settings.saveLocationUri != null) {
-                                            try {
-                                                highlightRepository.copyToFolderTree(
-                                                    outputFile,
-                                                    Uri.parse(settings.saveLocationUri)
-                                                )
-                                                exportMessage = "Export saved to My Videos and copied to the selected folder"
-                                            } catch (exception: IOException) {
-                                                exportMessage =
-                                                    "Export saved to My Videos, but the selected-folder copy failed: " +
-                                                        (exception.localizedMessage ?: "storage error")
-                                            } catch (exception: SecurityException) {
-                                                exportMessage =
-                                                    "Export saved to My Videos, but Android denied access to the selected folder"
-                                            } catch (exception: IllegalArgumentException) {
-                                                exportMessage =
-                                                    "Export saved to My Videos, but the selected folder is no longer available"
+                                        try {
+                                            val folderUri = settings.saveLocationUri?.let(Uri::parse)
+                                                ?: throw IOException("Choose a gallery folder in Settings")
+                                            highlightRepository.copyToFolderTree(outputFile, folderUri)
+                                            if (!outputFile.delete()) {
+                                                exportMessage = "Export saved to the selected folder, but its temporary copy could not be removed"
+                                            } else {
+                                                exportMessage = "Export saved to the selected gallery folder"
                                             }
+                                            highlights = highlightRepository.listHighlights(folderUri)
+                                        } catch (exception: IOException) {
+                                            val temporaryCopyRemoved = outputFile.delete()
+                                            exportMessage =
+                                                "Could not save export to the selected folder: " +
+                                                    (exception.localizedMessage ?: "storage error") +
+                                                    if (temporaryCopyRemoved) "" else ". Temporary export could not be removed"
+                                        } catch (exception: SecurityException) {
+                                            val temporaryCopyRemoved = outputFile.delete()
+                                            exportMessage =
+                                                "Could not save export: Android denied access to the selected folder" +
+                                                    if (temporaryCopyRemoved) "" else ". Temporary export could not be removed"
+                                        } catch (exception: IllegalArgumentException) {
+                                            val temporaryCopyRemoved = outputFile.delete()
+                                            exportMessage =
+                                                "Could not save export: the selected folder is no longer available" +
+                                                    if (temporaryCopyRemoved) "" else ". Temporary export could not be removed"
                                         }
                                     }
 
@@ -346,20 +408,36 @@ class MainActivity : ComponentActivity() {
                         contract = ActivityResultContracts.StartActivityForResult()
                     ) { result ->
                         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-                            ContextCompat.startForegroundService(
-                                this,
-                                ScreenCaptureService.startIntent(
+                            val resultData = result.data ?: return@rememberLauncherForActivityResult
+                            if (shouldPrepareFloatingRecorder) {
+                                shouldPrepareFloatingRecorder = false
+                                ContextCompat.startForegroundService(
                                     this,
-                                    result.resultCode,
-                                    result.data ?: Intent(),
-                                    settings
+                                    ScreenCaptureService.prepareIntent(
+                                        this,
+                                        result.resultCode,
+                                        resultData,
+                                        settings
+                                    )
                                 )
-                            )
-                            isCapturing = true
-                            isPaused = false
-                            statusMessage = "Recording"
-                            recordingSeconds = 0
+                                statusMessage = "Floating recorder is ready. Start recording from its overlay."
+                            } else {
+                                ContextCompat.startForegroundService(
+                                    this,
+                                    ScreenCaptureService.startIntent(
+                                        this,
+                                        result.resultCode,
+                                        resultData,
+                                        settings
+                                    )
+                                )
+                                isCapturing = true
+                                isPaused = false
+                                statusMessage = "Recording"
+                                recordingSeconds = 0
+                            }
                         } else {
+                            shouldPrepareFloatingRecorder = false
                             isCapturing = false
                             recordingSeconds = 0
                             statusMessage = "Capture permission denied"
@@ -393,13 +471,66 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
+                    fun requestRecordingStart() {
+                        shouldPrepareFloatingRecorder = false
+                        if (settings.saveLocationUri == null) {
+                            statusMessage = "Choose a gallery save folder in Settings before recording"
+                            selectedDestination = RecorderDestination.SETTINGS.name
+                            return
+                        }
+                        val needsAudioPermission = settings.audioSource != RecordingAudioSource.SILENT
+                        if (
+                            needsAudioPermission &&
+                            ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.RECORD_AUDIO
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            shouldStartAfterAudioPermission = true
+                            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else if (shouldRequestNotificationPermission()) {
+                            shouldStartAfterNotificationPermission = true
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                        }
+                    }
+
+                    fun prepareFloatingRecorder() {
+                        if (settings.saveLocationUri == null) {
+                            statusMessage = "Choose a gallery save folder in Settings before preparing capture"
+                            return
+                        }
+                        if (isCapturing) {
+                            statusMessage = "Stop the current recording before preparing floating capture"
+                            return
+                        }
+                        shouldPrepareFloatingRecorder = true
+                        val needsAudioPermission = settings.audioSource != RecordingAudioSource.SILENT
+                        if (
+                            needsAudioPermission &&
+                            ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.RECORD_AUDIO
+                            ) != PackageManager.PERMISSION_GRANTED
+                        ) {
+                            shouldStartAfterAudioPermission = true
+                            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else if (shouldRequestNotificationPermission()) {
+                            shouldStartAfterNotificationPermission = true
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                        }
+                    }
+
                     LaunchedEffect(Unit) {
                         refreshCaptureUiState()
                     }
 
                     LaunchedEffect(selectedDestination) {
                         if (selectedDestination == RecorderDestination.TRIM.name) {
-                            highlights = highlightRepository.listHighlights()
+                            highlights = highlightRepository.listHighlights(settings.saveLocationUri?.let(Uri::parse))
                         }
                     }
 
@@ -448,7 +579,7 @@ class MainActivity : ComponentActivity() {
                                         if (!isCapturing) {
                                             ScreenCaptureService.setCapturing(false)
                                             recordingSeconds = 0
-                                            highlights = highlightRepository.listHighlights()
+                                            highlights = highlightRepository.listHighlights(settings.saveLocationUri?.let(Uri::parse))
                                         }
                                         val error = intent.getStringExtra(ScreenCaptureService.EXTRA_ERROR_MESSAGE)
                                         statusMessage = error ?: when {
@@ -500,77 +631,86 @@ class MainActivity : ComponentActivity() {
                         Scaffold(
                             containerColor = RecorderTheme.background,
                             bottomBar = {
-                                RecorderBottomNavigation(
-                                    selected = selectedTab,
-                                    onSelect = {
-                                        when (it) {
-                                            RecorderDestination.HOME -> {
-                                                showVideos = false
-                                                selectedDestination = RecorderDestination.HOME.name
+                                if (playbackVideoUri == null) {
+                                    RecorderBottomNavigation(
+                                        selected = selectedTab,
+                                        onSelect = {
+                                            when (it) {
+                                                RecorderDestination.HOME -> {
+                                                    showVideos = false
+                                                    selectedDestination = RecorderDestination.HOME.name
+                                                }
+                                                RecorderDestination.VIDEOS -> showVideos = true
+                                                RecorderDestination.PROFILE -> {
+                                                    showVideos = false
+                                                    selectedDestination = RecorderDestination.SETTINGS.name
+                                                }
+                                                else -> Unit
                                             }
-                                            RecorderDestination.VIDEOS -> showVideos = true
-                                            RecorderDestination.PROFILE -> {
-                                                showVideos = false
-                                                selectedDestination = RecorderDestination.SETTINGS.name
-                                            }
-                                            else -> Unit
                                         }
-                                    }
-                                )
+                                    )
+                                }
                             }
                         ) { contentPadding ->
                             Column(
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .padding(contentPadding)
-                                    .verticalScroll(rememberScrollState())
-                                    .padding(horizontal = 20.dp, vertical = 18.dp),
-                                verticalArrangement = Arrangement.spacedBy(18.dp)
+                                    .padding(
+                                        horizontal = if (playbackVideoUri == null) 20.dp else 0.dp,
+                                        vertical = if (playbackVideoUri == null) 18.dp else 0.dp
+                                    )
                             ) {
-                                if (showVideos) {
+                                if (playbackVideoUri != null) {
+                                    com.mlbb.highlight.ui.VideoPlaybackScreen(
+                                        title = playbackVideoTitle,
+                                        videoUri = playbackVideoUri!!,
+                                        onBack = { playbackVideoUri = null },
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else if (showVideos) {
                                     com.mlbb.highlight.ui.EditorScreenHeader(
                                         title = "My videos",
                                         onBack = { showVideos = false }
                                     )
                                     HighlightsScreen(
                                         highlights = highlights,
+                                        message = videoLibraryMessage,
+                                        modifier = Modifier.weight(1f),
                                         onPlay = { entity ->
-                                            val file = java.io.File(entity.filePath)
-                                            if (!file.exists() || !file.isFile || file.length() <= 0L) {
-                                                statusMessage = "Recording file is missing or empty"
-                                                return@HighlightsScreen
+                                            try {
+                                                playbackVideoTitle = entity.title
+                                                playbackVideoUri = videoUriFor(entity.filePath).toString()
+                                            } catch (exception: IllegalArgumentException) {
+                                                videoLibraryMessage = exception.localizedMessage
+                                                    ?: "Recording file is missing or empty"
                                             }
-                                            val uri = FileProvider.getUriForFile(
-                                                this@MainActivity,
-                                                "$packageName.fileprovider",
-                                                file
-                                            )
-                                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                                setDataAndType(uri, "video/mp4")
-                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                            }
-                                            startActivity(intent)
                                         },
                                         onDelete = { entity ->
-                                            highlightRepository.deleteHighlight(entity)
-                                            highlights = highlightRepository.listHighlights()
-                                        },
-                                        onShare = { entity ->
-                                            val uri = FileProvider.getUriForFile(
-                                                this@MainActivity,
-                                                "$packageName.fileprovider",
-                                                java.io.File(entity.filePath)
-                                            )
-                                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                                type = "video/mp4"
-                                                putExtra(Intent.EXTRA_STREAM, uri)
-                                                putExtra(Intent.EXTRA_SUBJECT, entity.title)
-                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            try {
+                                                highlightRepository.deleteHighlight(entity)
+                                                highlights = highlightRepository.listHighlights(
+                                                    settings.saveLocationUri?.let(Uri::parse)
+                                                )
+                                                videoLibraryMessage = null
+                                            } catch (exception: IOException) {
+                                                videoLibraryMessage = "Could not delete video: " +
+                                                    (exception.localizedMessage ?: "storage error")
+                                            } catch (exception: SecurityException) {
+                                                videoLibraryMessage = "Android denied access to delete this video"
+                                            } catch (exception: IllegalArgumentException) {
+                                                videoLibraryMessage = "Could not delete video: " +
+                                                    (exception.localizedMessage ?: "storage error")
                                             }
-                                            startActivity(Intent.createChooser(shareIntent, "Share recording"))
                                         }
                                     )
                                 } else {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .verticalScroll(rememberScrollState()),
+                                        verticalArrangement = Arrangement.spacedBy(18.dp)
+                                    ) {
                                     when (currentDestination) {
                                         RecorderDestination.HOME -> RecorderHomeScreen(
                                             isCapturing = isCapturing,
@@ -578,26 +718,7 @@ class MainActivity : ComponentActivity() {
                                             recordingSeconds = recordingSeconds,
                                             statusMessage = statusMessage,
                                             settings = settings,
-                                            onStart = {
-                                                val needsAudioPermission =
-                                                    settings.audioSource != RecordingAudioSource.SILENT ||
-                                                        settings.voiceCommandsEnabled
-                                                if (
-                                                    needsAudioPermission &&
-                                                    ContextCompat.checkSelfPermission(
-                                                        this@MainActivity,
-                                                        Manifest.permission.RECORD_AUDIO
-                                                    ) != PackageManager.PERMISSION_GRANTED
-                                                ) {
-                                                    shouldStartAfterAudioPermission = true
-                                                    audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                                } else if (shouldRequestNotificationPermission()) {
-                                                    shouldStartAfterNotificationPermission = true
-                                                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                                                } else {
-                                                    projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
-                                                }
-                                            },
+                                            onStart = ::requestRecordingStart,
                                             onPauseResume = {
                                                 startService(ScreenCaptureService.pauseResumeIntent(this@MainActivity))
                                             },
@@ -623,17 +744,10 @@ class MainActivity : ComponentActivity() {
                                             savedVideos = highlights,
                                             onPickVideo = { videoPickerLauncher.launch(arrayOf("video/*")) },
                                             onSelectSavedVideo = { entity ->
-                                                val file = java.io.File(entity.filePath)
-                                                if (!file.isFile || file.length() <= 0L) {
-                                                    exportMessage = "This saved video is missing or empty"
-                                                } else {
-                                                    selectEditorVideo(
-                                                        FileProvider.getUriForFile(
-                                                            this@MainActivity,
-                                                            "$packageName.fileprovider",
-                                                            file
-                                                        )
-                                                    )
+                                                try {
+                                                    selectEditorVideo(videoUriFor(entity.filePath))
+                                                } catch (exception: IllegalArgumentException) {
+                                                    exportMessage = "This saved video is unavailable"
                                                 }
                                             },
                                             onTrimChanged = { start, end ->
@@ -642,6 +756,9 @@ class MainActivity : ComponentActivity() {
                                                 trimEndMs = end.coerceAtLeast(trimStartMs)
                                                 effectStartMs = 0L
                                                 effectEndMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
+                                                sceneEffects = emptyList()
+                                                appliedSceneEffects = emptyList()
+                                                selectedSceneId = ""
                                             },
                                             onDurationChanged = { duration ->
                                                 if (duration > 0L && duration != sourceDurationMs) {
@@ -670,10 +787,11 @@ class MainActivity : ComponentActivity() {
                                             effectStartMs = effectStartMs,
                                             effectEndMs = effectEndMs,
                                             isPreviewApplied = isEffectPreviewApplied,
-                                            appliedEffectOptions = appliedEffectOptions,
-                                            appliedEffectStartMs = appliedEffectStartMs,
-                                            appliedEffectEndMs = appliedEffectEndMs,
                                             previewRequestId = previewRequestId,
+                                            sceneEffects = sceneEffects,
+                                            selectedSceneId = selectedSceneId,
+                                            appliedSceneEffects = appliedSceneEffects,
+                                            playheadMs = playheadMs,
                                             onEffectRangeChanged = { start, end ->
                                                 isEffectPreviewApplied = false
                                                 val clipDuration = (trimEndMs - trimStartMs).coerceAtLeast(0L)
@@ -682,7 +800,36 @@ class MainActivity : ComponentActivity() {
                                                     effectStartMs,
                                                     clipDuration
                                                 )
+                                                sceneEffects = sceneEffects.map { scene ->
+                                                    if (scene.id == selectedSceneId) {
+                                                        scene.copy(
+                                                            startMs = effectStartMs,
+                                                            endMs = effectEndMs,
+                                                            eventTimeMs = scene.eventTimeMs?.coerceIn(
+                                                                effectStartMs,
+                                                                effectEndMs
+                                                            )
+                                                        )
+                                                    } else scene
+                                                }
                                             },
+                                            onSceneEffectsChanged = {
+                                                isEffectPreviewApplied = false
+                                                sceneEffects = it
+                                                it.firstOrNull { scene -> scene.id == selectedSceneId }?.let { scene ->
+                                                    effectStartMs = scene.startMs
+                                                    effectEndMs = scene.endMs
+                                                    effectOptions = scene.options
+                                                }
+                                            },
+                                            onSceneSelected = { scene ->
+                                                selectedSceneId = scene.id
+                                                effectStartMs = scene.startMs
+                                                effectEndMs = scene.endMs
+                                                effectOptions = scene.options
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onPlayheadChanged = { playheadMs = it },
                                             onDurationChanged = { duration ->
                                                 if (duration > 0L && duration != sourceDurationMs) {
                                                     sourceDurationMs = duration
@@ -699,14 +846,23 @@ class MainActivity : ComponentActivity() {
                                             onOptionsChanged = {
                                                 isEffectPreviewApplied = false
                                                 effectOptions = it
+                                                sceneEffects = sceneEffects.map { scene ->
+                                                    if (scene.id == selectedSceneId) scene.copy(options = it) else scene
+                                                }
                                             },
                                             onApplyPreview = {
-                                                appliedEffectOptions = effectOptions
-                                                appliedEffectStartMs = effectStartMs
-                                                appliedEffectEndMs = effectEndMs
+                                                if (sceneEffects.none {
+                                                        it.endMs > it.startMs &&
+                                                            it.options.preset != VideoEffectPreset.NONE
+                                                    }
+                                                ) {
+                                                    exportMessage = "Choose an effect for a scene before previewing"
+                                                    return@EffectsScreen
+                                                }
+                                                appliedSceneEffects = sceneEffects
                                                 isEffectPreviewApplied = true
                                                 previewRequestId += 1
-                                                exportMessage = "Effects applied to preview. Export when you are ready."
+                                                exportMessage = "Previewing all scene effects. Export when you are ready."
                                             },
                                             isExporting = isExporting,
                                             exportProgress = exportProgress,
@@ -738,13 +894,22 @@ class MainActivity : ComponentActivity() {
                                                     settingsRepository.save(updated)
                                                 },
                                                 saveLocationLabel = if (settings.saveLocationUri == null) {
-                                                    "App videos folder"
+                                                    "No folder selected"
                                                 } else {
                                                     "Selected folder"
                                                 },
                                                 appVersion = packageManager.getPackageInfo(packageName, 0).versionName
                                                     ?: "Unknown",
                                                 onChooseSaveLocation = { folderPickerLauncher.launch(null) },
+                                                onRequestOverlayPermission = {
+                                                    startActivity(
+                                                        Intent(
+                                                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                                            Uri.parse("package:$packageName")
+                                                        )
+                                                    )
+                                                },
+                                                onPrepareFloatingRecorder = ::prepareFloatingRecorder,
                                                 onResetSettings = {
                                                     settings = AppSettings()
                                                     settingsRepository.save(settings)
@@ -753,6 +918,7 @@ class MainActivity : ComponentActivity() {
                                         }
 
                                         RecorderDestination.VIDEOS, RecorderDestination.PROFILE -> Unit
+                                    }
                                     }
                                 }
                             }
@@ -773,4 +939,5 @@ class MainActivity : ComponentActivity() {
         val remainingSeconds = seconds % 60
         return "%02d:%02d".format(minutes, remainingSeconds)
     }
+
 }
