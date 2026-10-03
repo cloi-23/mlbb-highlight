@@ -72,6 +72,7 @@ import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.audio.SpeedProvider
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.delay
@@ -93,7 +94,11 @@ enum class VideoEffectPreset(val label: String) {
     IMPACT_OVERLAY("Hit Overlay"),
     KILL_IMPACT("Kill Impact"),
     KILL_SLOWMO("Kill Slowmo"),
-    SAVAGE("Savage")
+    SAVAGE("Savage"),
+    BLUR("Blur"),
+    BRIGHTNESS("Brightness"),
+    CONTRAST("Contrast"),
+    SATURATION("Saturation")
 }
 
 data class VideoEffectOptions(
@@ -106,7 +111,11 @@ data class VideoEffectOptions(
     val colorGrading: Float = 0.5f,
     val zoomScale: Float = 1.06f,
     val shakeAmount: Float = 0.5f,
-    val opacity: Float = 0.7f
+    val opacity: Float = 0.7f,
+    val blurAmount: Float = 0.4f,
+    val brightnessAmount: Float = 0.35f,
+    val contrastAmount: Float = 0.35f,
+    val saturationAmount: Float = 0.35f
 )
 
 @Composable
@@ -512,16 +521,12 @@ private fun VideoTimeline(
 
 @Composable
 fun EffectsScreen(
-    videoUri: String?,
-    startMs: Long,
-    endMs: Long,
+    editState: VideoEditState,
     effectStartMs: Long,
     effectEndMs: Long,
     isPreviewApplied: Boolean,
     previewRequestId: Int,
-    sceneEffects: List<SceneEffect>,
     selectedSceneId: String,
-    appliedSceneEffects: List<SceneEffect>,
     playheadMs: Long,
     onEffectRangeChanged: (Long, Long) -> Unit,
     onSceneEffectsChanged: (List<SceneEffect>) -> Unit,
@@ -540,7 +545,14 @@ fun EffectsScreen(
     onOpenVideos: () -> Unit
 ) {
     val context = LocalContext.current
+    val videoUri = editState.sourceVideoUri
+    val startMs = editState.trimStartMs
+    val endMs = editState.trimEndMs
+    val sceneEffects = editState.sceneEffects
     val selectedScene = sceneEffects.firstOrNull { it.id == selectedSceneId }
+    val effectPipeline = remember(editState) {
+        buildVideoEffects(editState, EffectTimestampBasis.SOURCE_VIDEO)
+    }
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         EditorScreenHeader(
             title = "Effects",
@@ -560,44 +572,23 @@ fun EffectsScreen(
                 onClick = onGoToTrim
             )
         } else {
-            val previewVideoEffects = remember(
-                isPreviewApplied,
-                appliedSceneEffects,
-                startMs
-            ) {
-                if (!isPreviewApplied) emptyList() else appliedSceneEffects.flatMap { scene ->
-                    val sceneStartUs = (startMs + scene.startMs) * 1_000L
-                    val sceneEndUs = (startMs + scene.endMs) * 1_000L
-                    if (sceneEndUs <= sceneStartUs || scene.options.preset == VideoEffectPreset.NONE) {
-                        emptyList()
-                    } else {
-                        createSceneVideoEffects(
-                            scene.options,
-                            sceneStartUs,
-                            sceneEndUs,
-                            (startMs + (scene.eventTimeMs ?: (scene.startMs + 200L))) * 1_000L
-                        )
-                    }
-                }
-            }
             val previewSceneStartMs = startMs + (selectedScene?.startMs ?: effectStartMs)
             VideoPreview(
                 videoUri = videoUri,
                 startMs = startMs,
                 endMs = endMs,
                 onDurationChanged = onDurationChanged,
-                videoEffects = previewVideoEffects,
-                slowMotionCues = if (isPreviewApplied) appliedSceneEffects else emptyList(),
+                videoEffects = effectPipeline.videoEffects,
+                speedProvider = effectPipeline.speedProvider,
                 onPositionChanged = { position ->
                     onPlayheadChanged((position - startMs).coerceIn(0L, (endMs - startMs).coerceAtLeast(0L)))
                 },
-                slowMotionOffsetMs = startMs,
                 previewSeekMs = previewSceneStartMs,
                 previewRequestId = previewRequestId
             )
-            if (isPreviewApplied) {
+            if (sceneEffects.any { it.options.preset != VideoEffectPreset.NONE }) {
                 Text(
-                    "Preview effects are active on their assigned scenes. Slow motion changes playback speed only inside those ranges.",
+                    "Effects update the preview on their assigned scenes. Slow motion applies only inside its selected range.",
                     color = RecorderTheme.cyan,
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -697,7 +688,9 @@ fun EffectsScreen(
                 val effectRows = listOf(
                     listOf(VideoEffectPreset.IMPACT, VideoEffectPreset.SHAKE, VideoEffectPreset.FLASH),
                     listOf(VideoEffectPreset.SLOW_MOTION, VideoEffectPreset.ZOOM, VideoEffectPreset.GLOW),
-                    listOf(VideoEffectPreset.IMPACT_OVERLAY, VideoEffectPreset.SAVAGE, VideoEffectPreset.NONE)
+                    listOf(VideoEffectPreset.BLUR, VideoEffectPreset.BRIGHTNESS, VideoEffectPreset.CONTRAST),
+                    listOf(VideoEffectPreset.SATURATION, VideoEffectPreset.IMPACT_OVERLAY, VideoEffectPreset.SAVAGE),
+                    listOf(VideoEffectPreset.NONE)
                 )
                 effectRows.forEach { rowPresets ->
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -734,6 +727,82 @@ fun EffectsScreen(
                         value = options.slowMotionSpeed,
                         onValueChange = { onOptionsChanged(options.copy(slowMotionSpeed = it)) },
                         valueRange = 0.25f..0.9f
+                    )
+                }
+                if (
+                    selectedScene != null &&
+                    options.preset in setOf(
+                        VideoEffectPreset.ZOOM,
+                        VideoEffectPreset.IMPACT,
+                        VideoEffectPreset.KILL_IMPACT,
+                        VideoEffectPreset.KILL_SLOWMO,
+                        VideoEffectPreset.SAVAGE
+                    )
+                ) {
+                    Text("Zoom · ${(options.zoomScale * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.zoomScale,
+                        onValueChange = { onOptionsChanged(options.copy(zoomScale = it)) },
+                        valueRange = 1.01f..1.2f
+                    )
+                }
+                if (
+                    selectedScene != null &&
+                    options.preset in setOf(
+                        VideoEffectPreset.SHAKE,
+                        VideoEffectPreset.IMPACT,
+                        VideoEffectPreset.KILL_IMPACT,
+                        VideoEffectPreset.SAVAGE
+                    )
+                ) {
+                    Text("Shake · ${(options.shakeAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.shakeAmount,
+                        onValueChange = { onOptionsChanged(options.copy(shakeAmount = it)) }
+                    )
+                }
+                if (
+                    selectedScene != null &&
+                    options.preset in setOf(
+                        VideoEffectPreset.FLASH,
+                        VideoEffectPreset.IMPACT,
+                        VideoEffectPreset.KILL_IMPACT,
+                        VideoEffectPreset.IMPACT_OVERLAY,
+                        VideoEffectPreset.SAVAGE
+                    )
+                ) {
+                    Text("Opacity · ${(options.opacity * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.opacity,
+                        onValueChange = { onOptionsChanged(options.copy(opacity = it)) }
+                    )
+                }
+                if (selectedScene != null && options.preset == VideoEffectPreset.BLUR) {
+                    Text("Blur · ${(options.blurAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.blurAmount,
+                        onValueChange = { onOptionsChanged(options.copy(blurAmount = it)) }
+                    )
+                }
+                if (selectedScene != null && options.preset == VideoEffectPreset.BRIGHTNESS) {
+                    Text("Brightness · ${(options.brightnessAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.brightnessAmount,
+                        onValueChange = { onOptionsChanged(options.copy(brightnessAmount = it)) }
+                    )
+                }
+                if (selectedScene != null && options.preset == VideoEffectPreset.CONTRAST) {
+                    Text("Contrast · ${(options.contrastAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.contrastAmount,
+                        onValueChange = { onOptionsChanged(options.copy(contrastAmount = it)) }
+                    )
+                }
+                if (selectedScene != null && options.preset == VideoEffectPreset.SATURATION) {
+                    Text("Saturation · ${(options.saturationAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(
+                        value = options.saturationAmount,
+                        onValueChange = { onOptionsChanged(options.copy(saturationAmount = it)) }
                     )
                 }
             }
@@ -823,8 +892,7 @@ private fun VideoPreview(
     endMs: Long,
     onDurationChanged: (Long) -> Unit,
     videoEffects: List<Effect> = emptyList(),
-    slowMotionCues: List<SceneEffect> = emptyList(),
-    slowMotionOffsetMs: Long = 0L,
+    speedProvider: SpeedProvider? = null,
     previewSeekMs: Long = startMs,
     onPositionChanged: (Long) -> Unit = {},
     previewRequestId: Int = 0
@@ -868,8 +936,7 @@ private fun VideoPreview(
         player,
         startMs,
         endMs,
-        slowMotionCues,
-        slowMotionOffsetMs
+        speedProvider
     ) {
         while (true) {
             positionMs = player.currentPosition.coerceAtLeast(0L)
@@ -883,13 +950,7 @@ private fun VideoPreview(
                 player.pause()
                 player.seekTo(startMs)
             }
-            val desiredSpeed = slowMotionCues
-                .filter { it.options.usesSlowMotion() }
-                .filter { cue ->
-                    positionMs >= slowMotionOffsetMs + cue.startMs &&
-                        positionMs < slowMotionOffsetMs + cue.endMs
-                }
-                .minOfOrNull { it.options.slowMotionSpeed.coerceIn(0.25f, 0.9f) } ?: 1f
+            val desiredSpeed = speedProvider?.getSpeed(positionMs * 1_000L) ?: 1f
             if (desiredSpeed != appliedPlaybackSpeed) {
                 player.setPlaybackSpeed(desiredSpeed)
                 appliedPlaybackSpeed = desiredSpeed

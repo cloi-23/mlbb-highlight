@@ -10,6 +10,7 @@ import androidx.media3.effect.Brightness
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Contrast
 import androidx.media3.effect.GlEffect
+import androidx.media3.effect.GaussianBlur
 import androidx.media3.effect.HslAdjustment
 import androidx.media3.effect.MatrixTransformation
 import androidx.media3.effect.OverlayEffect
@@ -64,18 +65,18 @@ fun createSceneVideoEffects(
             VideoEffectPreset.IMPACT,
             VideoEffectPreset.KILL_IMPACT -> {
                 add(TimestampWrapper(Contrast(0.2f * intensity), sceneStartUs, sceneEndUs))
-                add(zoom(options.zoomScale, sceneStartUs, sceneEndUs))
+                add(zoom(options.zoomScale, eventTimeUs, sceneStartUs, sceneEndUs))
                 add(createKillShakeEffect(intensity, options.shakeAmount, eventTimeUs, sceneEndUs))
             }
             VideoEffectPreset.SHAKE ->
                 add(createKillShakeEffect(intensity, options.shakeAmount, eventTimeUs, sceneEndUs))
             VideoEffectPreset.ZOOM ->
-                add(zoom(options.zoomScale, sceneStartUs, sceneEndUs))
+                add(zoom(options.zoomScale, eventTimeUs, sceneStartUs, sceneEndUs))
             VideoEffectPreset.IMPACT_OVERLAY ->
                 add(createTextImpactOverlay("IMPACT", options.opacity, eventTimeUs, sceneEndUs))
             VideoEffectPreset.SAVAGE -> {
                 add(TimestampWrapper(Contrast(0.2f * intensity), sceneStartUs, sceneEndUs))
-                add(zoom((options.zoomScale + 0.04f).coerceAtMost(1.18f), sceneStartUs, sceneEndUs))
+                add(zoom((options.zoomScale + 0.04f).coerceAtMost(1.18f), eventTimeUs, sceneStartUs, sceneEndUs))
                 add(createKillShakeEffect(intensity, options.shakeAmount, eventTimeUs, sceneEndUs))
                 add(createTextImpactOverlay("SAVAGE!", options.opacity, eventTimeUs, sceneEndUs))
             }
@@ -83,6 +84,22 @@ fun createSceneVideoEffects(
             VideoEffectPreset.NONE,
             VideoEffectPreset.SLOW_MOTION,
             VideoEffectPreset.KILL_SLOWMO -> Unit
+            VideoEffectPreset.BLUR ->
+                add(TimestampWrapper(GaussianBlur(2f + 14f * options.blurAmount.coerceIn(0f, 1f)), sceneStartUs, sceneEndUs))
+            VideoEffectPreset.BRIGHTNESS ->
+                add(TimestampWrapper(Brightness(options.brightnessAmount.coerceIn(0f, 1f)), sceneStartUs, sceneEndUs))
+            VideoEffectPreset.CONTRAST ->
+                add(TimestampWrapper(Contrast(options.contrastAmount.coerceIn(0f, 1f)), sceneStartUs, sceneEndUs))
+            VideoEffectPreset.SATURATION ->
+                add(
+                    TimestampWrapper(
+                        HslAdjustment.Builder()
+                            .adjustSaturation(options.saturationAmount.coerceIn(0f, 1f))
+                            .build(),
+                        sceneStartUs,
+                        sceneEndUs
+                    )
+                )
         }
 
         val grading = options.colorGrading - 0.5f
@@ -104,11 +121,12 @@ fun createSceneVideoEffects(
             preset == VideoEffectPreset.KILL_IMPACT ||
             preset == VideoEffectPreset.SAVAGE
         ) {
+            val flashStartUs = eventTimeUs.coerceIn(sceneStartUs, sceneEndUs - 1L)
             add(
                 TimestampWrapper(
                     createOpeningFlashEffect(intensity * options.opacity.coerceIn(0f, 1f), eventTimeUs),
-                    sceneStartUs,
-                    sceneEndUs
+                    flashStartUs,
+                    minOf(sceneEndUs, flashStartUs + 140_000L).coerceAtLeast(flashStartUs + 1L)
                 )
             )
         }
@@ -128,15 +146,26 @@ fun createSceneVideoEffects(
             )
         }
         if (preset == VideoEffectPreset.KILL_SLOWMO) {
-            add(zoom(1.035f, sceneStartUs, sceneEndUs))
+            add(zoom(1.035f, eventTimeUs, sceneStartUs, sceneEndUs))
         }
     }
 }
 
-private fun zoom(scale: Float, startUs: Long, endUs: Long): GlEffect =
+private fun zoom(scale: Float, eventTimeUs: Long, startUs: Long, endUs: Long): GlEffect =
     TimestampWrapper(
-        MatrixTransformation { _ ->
-            val boundedScale = scale.coerceIn(1f, 1.2f)
+        MatrixTransformation { presentationTimeUs ->
+            val boundedEventTimeUs = eventTimeUs.coerceIn(startUs, endUs)
+            val progress = if (presentationTimeUs <= boundedEventTimeUs) {
+                val anticipationDurationUs = (boundedEventTimeUs - startUs).coerceAtLeast(1L)
+                ((presentationTimeUs - startUs).toFloat() / anticipationDurationUs)
+                    .coerceIn(0f, 1f)
+            } else {
+                val recoveryDurationUs = (endUs - boundedEventTimeUs).coerceAtLeast(1L)
+                1f - ((presentationTimeUs - boundedEventTimeUs).toFloat() / recoveryDurationUs)
+                    .coerceIn(0f, 1f)
+            }
+            val pulse = kotlin.math.sin(progress * Math.PI / 2.0).toFloat()
+            val boundedScale = 1f + (scale.coerceIn(1f, 1.2f) - 1f) * pulse
             android.graphics.Matrix().apply { setScale(boundedScale, boundedScale, 0.5f, 0.5f) }
         },
         startUs,

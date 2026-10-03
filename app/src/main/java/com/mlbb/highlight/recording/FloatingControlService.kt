@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -21,6 +22,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.mlbb.highlight.R
@@ -37,16 +39,21 @@ class FloatingControlService : Service() {
     private var compactButton: TextView? = null
     private var isCapturing = ScreenCaptureService.isCapturing
     private var isPaused = ScreenCaptureService.isPaused
-    private var isProjectionReady = ScreenCaptureService.isProjectionReady
+    private var isRequestingCapture = false
     private var receiverRegistered = false
 
     private val captureStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != ScreenCaptureService.ACTION_STATUS_CHANGED) return
+            isRequestingCapture = false
             isCapturing = intent.getBooleanExtra(ScreenCaptureService.EXTRA_IS_CAPTURING, false)
             isPaused = intent.getBooleanExtra(ScreenCaptureService.EXTRA_IS_PAUSED, false)
-            isProjectionReady = intent.getBooleanExtra(ScreenCaptureService.EXTRA_IS_PREPARED, false)
             refreshButtons()
+            intent.getStringExtra(ScreenCaptureService.EXTRA_ERROR_MESSAGE)?.let { message ->
+                stateLabel?.text = message
+                stateLabel?.setTextColor(COLOR_PAUSED)
+                Toast.makeText(this@FloatingControlService, message, Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -66,7 +73,6 @@ class FloatingControlService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP_CONTROLS -> {
-                startService(ScreenCaptureService.cancelPreparedIntent(this))
                 stopSelf()
             }
         }
@@ -265,27 +271,37 @@ class FloatingControlService : Service() {
     }
 
     private fun requestCapture() {
-        if (isCapturing) return
-        if (!isProjectionReady) {
-            stateLabel?.text = "Prepare in recorder app first"
-            stateLabel?.setTextColor(COLOR_PAUSED)
-            return
+        if (isCapturing || isRequestingCapture) return
+        isRequestingCapture = true
+        refreshButtons()
+        try {
+            startActivity(
+                Intent(this, ProjectionConsentActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (error: ActivityNotFoundException) {
+            isRequestingCapture = false
+            refreshButtons()
+            showCaptureStartError("Could not open Android's screen-capture permission")
+        } catch (error: SecurityException) {
+            isRequestingCapture = false
+            refreshButtons()
+            showCaptureStartError("Android blocked the screen-capture permission prompt")
         }
-        startService(ScreenCaptureService.startPreparedIntent(this))
     }
 
     private fun refreshButtons() {
-        startButton?.isEnabled = !isCapturing && isProjectionReady
+        startButton?.isEnabled = !isCapturing && !isRequestingCapture
         pauseButton?.isEnabled = isCapturing
         stopButton?.isEnabled = isCapturing
-        startButton?.alpha = if (isCapturing) 0.45f else 1f
+        startButton?.alpha = if (isCapturing || isRequestingCapture) 0.45f else 1f
         pauseButton?.alpha = if (isCapturing) 1f else 0.45f
         stopButton?.alpha = if (isCapturing) 1f else 0.45f
         pauseButton?.text = if (isPaused) "Resume" else "Pause"
         stateLabel?.apply {
             text = when {
-                !isCapturing && isProjectionReady -> "Ready to record"
-                !isCapturing -> "Prepare in recorder app"
+                isRequestingCapture -> "Waiting for permission"
+                !isCapturing -> "Ready to start"
                 isPaused -> "Recording paused"
                 else -> "Recording"
             }
@@ -301,6 +317,12 @@ class FloatingControlService : Service() {
             text = if (!isCapturing) "REC" else if (isPaused) "Ⅱ" else "●"
             setTextColor(if (isCapturing && !isPaused) COLOR_RECORDING else Color.WHITE)
         }
+    }
+
+    private fun showCaptureStartError(message: String) {
+        stateLabel?.text = message
+        stateLabel?.setTextColor(COLOR_PAUSED)
+        Toast.makeText(this, message, Toast.LENGTH_LONG).show()
     }
 
     private fun actionButton(

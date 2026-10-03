@@ -14,7 +14,7 @@ An Android screen recorder for capturing complete Mobile Legends: Bang Bang game
 - Save and manage recordings in the app with play, delete, and share actions.
 - Import recordings or other videos, preview them, and trim a clip with draggable timeline handles.
 - In Effects, add scenes manually, then choose one effect per scene.
-- Preview the non-destructive edit before exporting. Adjust effect intensity and slow-motion speed when selected.
+- Preview the non-destructive edit before exporting. Scene color, blur, flash, zoom, shake, and slow-motion settings are shared by the Media3 preview and export pipeline.
 - Use the Home dashboard to open Trim, Effects, and Settings, with Home, My Videos, and Profile in the bottom navigation.
 
 The recorder currently targets manual, full-session capture. Automatic event detection and replay highlights are not part of this workflow.
@@ -76,6 +76,7 @@ app/build/outputs/apk/debug/app-debug.apk
 - English is currently the only app language.
 - Scene selection in the Effects editor is manual.
 - Visual effects are silent overlays/transforms; no separate impact sound effect is currently added.
+- Effect order is deterministic: scene color adjustments, geometric zoom/shake, blur, then flash or text overlay. Scene timing is relative to the selected clip; preview offsets it to the source-video timeline and export applies it to the clipped timeline.
 - Validate long-session stability, audio/video synchronization, and output playback across devices.
 - Revisit replay highlights and OCR/event detection if the product direction changes
 

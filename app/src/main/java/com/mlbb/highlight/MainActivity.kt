@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -78,8 +79,9 @@ import com.mlbb.highlight.ui.TrimScreen
 import com.mlbb.highlight.ui.VideoEffectOptions
 import com.mlbb.highlight.ui.VideoEffectPreset
 import com.mlbb.highlight.ui.SceneEffect
-import com.mlbb.highlight.ui.usesSlowMotion
-import com.mlbb.highlight.ui.createSceneVideoEffects
+import com.mlbb.highlight.ui.VideoEditState
+import com.mlbb.highlight.ui.EffectTimestampBasis
+import com.mlbb.highlight.ui.buildVideoEffects
 import kotlinx.coroutines.delay
 import java.util.concurrent.atomic.AtomicReference
 
@@ -139,9 +141,6 @@ class MainActivity : ComponentActivity() {
                     var shouldStartAfterAudioPermission by rememberSaveable {
                         mutableStateOf(false)
                     }
-                    var shouldPrepareFloatingRecorder by rememberSaveable {
-                        mutableStateOf(false)
-                    }
                     var highlights by remember {
                         mutableStateOf(
                             highlightRepository.listHighlights(settings.saveLocationUri?.let(Uri::parse))
@@ -154,15 +153,15 @@ class MainActivity : ComponentActivity() {
                     var videoLibraryMessage by rememberSaveable { mutableStateOf<String?>(null) }
                     var playbackVideoUri by rememberSaveable { mutableStateOf<String?>(null) }
                     var playbackVideoTitle by rememberSaveable { mutableStateOf("") }
-                    var selectedVideoUri by rememberSaveable { mutableStateOf<String?>(null) }
-                    var trimStartMs by rememberSaveable { mutableStateOf(0L) }
-                    var trimEndMs by rememberSaveable { mutableStateOf(0L) }
+                    var videoEditState by remember { mutableStateOf(VideoEditState()) }
+                    val selectedVideoUri = videoEditState.sourceVideoUri
+                    val trimStartMs = videoEditState.trimStartMs
+                    val trimEndMs = videoEditState.trimEndMs
+                    val sceneEffects = videoEditState.sceneEffects
                     var sourceDurationMs by rememberSaveable { mutableStateOf(0L) }
                     var effectStartMs by rememberSaveable { mutableStateOf(0L) }
                     var effectEndMs by rememberSaveable { mutableStateOf(0L) }
                     var effectOptions by remember { mutableStateOf(VideoEffectOptions()) }
-                    var sceneEffects by remember { mutableStateOf(emptyList<SceneEffect>()) }
-                    var appliedSceneEffects by remember { mutableStateOf(emptyList<SceneEffect>()) }
                     var selectedSceneId by rememberSaveable { mutableStateOf("") }
                     var playheadMs by rememberSaveable { mutableStateOf(0L) }
                     var isEffectPreviewApplied by rememberSaveable { mutableStateOf(false) }
@@ -186,15 +185,11 @@ class MainActivity : ComponentActivity() {
                             } catch (exception: SecurityException) {
                                 statusMessage = "Video selected, but Android could not keep access after closing the app"
                             }
-                            selectedVideoUri = uri.toString()
-                            trimStartMs = 0L
-                            trimEndMs = 0L
+                            videoEditState = VideoEditState(sourceVideoUri = uri.toString())
                             sourceDurationMs = 0L
                             effectStartMs = 0L
                             effectEndMs = 0L
                             effectOptions = VideoEffectOptions()
-                            sceneEffects = emptyList()
-                            appliedSceneEffects = emptyList()
                             selectedSceneId = ""
                             playheadMs = 0L
                             isEffectPreviewApplied = false
@@ -221,15 +216,11 @@ class MainActivity : ComponentActivity() {
                     }
 
                     fun selectEditorVideo(uri: Uri) {
-                        selectedVideoUri = uri.toString()
-                        trimStartMs = 0L
-                        trimEndMs = 0L
+                        videoEditState = VideoEditState(sourceVideoUri = uri.toString())
                         sourceDurationMs = 0L
                         effectStartMs = 0L
                         effectEndMs = 0L
                         effectOptions = VideoEffectOptions()
-                        sceneEffects = emptyList()
-                        appliedSceneEffects = emptyList()
                         selectedSceneId = ""
                         playheadMs = 0L
                         isEffectPreviewApplied = false
@@ -237,16 +228,8 @@ class MainActivity : ComponentActivity() {
                     }
 
                     fun startExport() {
-                        val inputUri = selectedVideoUri?.let(Uri::parse)
-                        val clipDurationMs = trimEndMs - trimStartMs
-                        val exportScenes = appliedSceneEffects.filter {
-                            it.endMs > it.startMs && it.options.preset != VideoEffectPreset.NONE
-                        }.map { scene ->
-                            scene.copy(
-                                startMs = scene.startMs.coerceIn(0L, clipDurationMs),
-                                endMs = scene.endMs.coerceIn(0L, clipDurationMs)
-                            )
-                        }.filter { it.endMs > it.startMs }
+                        val inputUri = videoEditState.sourceVideoUri?.let(Uri::parse)
+                        val exportScenes = videoEditState.exportableSceneEffects
                         if (
                             inputUri == null ||
                             trimEndMs <= trimStartMs ||
@@ -264,15 +247,10 @@ class MainActivity : ComponentActivity() {
                         }
 
                         val outputFile = highlightRepository.createEditedOutputFile()
-                        val videoEffects = exportScenes.flatMap { scene ->
-                            createSceneVideoEffects(
-                                scene.options,
-                                scene.startMs * 1_000L,
-                                scene.endMs * 1_000L,
-                                (scene.eventTimeMs ?: (scene.startMs + 200L)) * 1_000L
-                            )
-                        }
-                        val slowMotionScenes = exportScenes.filter { it.options.usesSlowMotion() }
+                        val effectPipeline = buildVideoEffects(
+                            videoEditState,
+                            EffectTimestampBasis.CLIPPED_VIDEO
+                        )
                         val mediaItem = MediaItem.Builder()
                             .setUri(inputUri)
                             .setClippingConfiguration(
@@ -283,24 +261,8 @@ class MainActivity : ComponentActivity() {
                             )
                             .build()
                         val editedItemBuilder = EditedMediaItem.Builder(mediaItem)
-                            .setEffects(Effects(emptyList(), videoEffects))
-                        if (slowMotionScenes.isNotEmpty()) {
-                            editedItemBuilder.setSpeed(
-                                object : SpeedProvider {
-                                    override fun getSpeed(timeUs: Long): Float =
-                                        slowMotionScenes
-                                            .filter { timeUs >= it.startMs * 1_000L && timeUs < it.endMs * 1_000L }
-                                            .minOfOrNull { it.options.slowMotionSpeed.coerceIn(0.25f, 0.9f) }
-                                            ?: 1f
-
-                                    override fun getNextSpeedChangeTimeUs(timeUs: Long): Long =
-                                        slowMotionScenes
-                                            .flatMap { listOf(it.startMs * 1_000L, it.endMs * 1_000L) }
-                                            .filter { it > timeUs }
-                                            .minOrNull() ?: C.TIME_UNSET
-                                }
-                            )
-                        }
+                            .setEffects(Effects(emptyList(), effectPipeline.videoEffects))
+                        effectPipeline.speedProvider?.let(editedItemBuilder::setSpeed)
                         val editedItem = editedItemBuilder.build()
 
                         val transformer = Transformer.Builder(applicationContext)
@@ -408,36 +370,20 @@ class MainActivity : ComponentActivity() {
                         contract = ActivityResultContracts.StartActivityForResult()
                     ) { result ->
                         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-                            val resultData = result.data ?: return@rememberLauncherForActivityResult
-                            if (shouldPrepareFloatingRecorder) {
-                                shouldPrepareFloatingRecorder = false
-                                ContextCompat.startForegroundService(
+                            ContextCompat.startForegroundService(
+                                this,
+                                ScreenCaptureService.startIntent(
                                     this,
-                                    ScreenCaptureService.prepareIntent(
-                                        this,
-                                        result.resultCode,
-                                        resultData,
-                                        settings
-                                    )
+                                    result.resultCode,
+                                    result.data ?: Intent(),
+                                    settings
                                 )
-                                statusMessage = "Floating recorder is ready. Start recording from its overlay."
-                            } else {
-                                ContextCompat.startForegroundService(
-                                    this,
-                                    ScreenCaptureService.startIntent(
-                                        this,
-                                        result.resultCode,
-                                        resultData,
-                                        settings
-                                    )
-                                )
-                                isCapturing = true
-                                isPaused = false
-                                statusMessage = "Recording"
-                                recordingSeconds = 0
-                            }
+                            )
+                            isCapturing = true
+                            isPaused = false
+                            statusMessage = "Recording"
+                            recordingSeconds = 0
                         } else {
-                            shouldPrepareFloatingRecorder = false
                             isCapturing = false
                             recordingSeconds = 0
                             statusMessage = "Capture permission denied"
@@ -449,7 +395,7 @@ class MainActivity : ComponentActivity() {
                     ) {
                         if (shouldStartAfterNotificationPermission) {
                             shouldStartAfterNotificationPermission = false
-                            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            projectionLauncher.launch(createScreenCaptureConsentIntent(projectionManager))
                         }
                     }
 
@@ -463,7 +409,7 @@ class MainActivity : ComponentActivity() {
                                     shouldStartAfterNotificationPermission = true
                                     notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 } else {
-                                    projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                                    projectionLauncher.launch(createScreenCaptureConsentIntent(projectionManager))
                                 }
                             } else {
                                 statusMessage = "Microphone permission denied; choose Silent or allow microphone access"
@@ -472,7 +418,6 @@ class MainActivity : ComponentActivity() {
                     }
 
                     fun requestRecordingStart() {
-                        shouldPrepareFloatingRecorder = false
                         if (settings.saveLocationUri == null) {
                             statusMessage = "Choose a gallery save folder in Settings before recording"
                             selectedDestination = RecorderDestination.SETTINGS.name
@@ -492,35 +437,7 @@ class MainActivity : ComponentActivity() {
                             shouldStartAfterNotificationPermission = true
                             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
-                            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
-                        }
-                    }
-
-                    fun prepareFloatingRecorder() {
-                        if (settings.saveLocationUri == null) {
-                            statusMessage = "Choose a gallery save folder in Settings before preparing capture"
-                            return
-                        }
-                        if (isCapturing) {
-                            statusMessage = "Stop the current recording before preparing floating capture"
-                            return
-                        }
-                        shouldPrepareFloatingRecorder = true
-                        val needsAudioPermission = settings.audioSource != RecordingAudioSource.SILENT
-                        if (
-                            needsAudioPermission &&
-                            ContextCompat.checkSelfPermission(
-                                this@MainActivity,
-                                Manifest.permission.RECORD_AUDIO
-                            ) != PackageManager.PERMISSION_GRANTED
-                        ) {
-                            shouldStartAfterAudioPermission = true
-                            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                        } else if (shouldRequestNotificationPermission()) {
-                            shouldStartAfterNotificationPermission = true
-                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        } else {
-                            projectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            projectionLauncher.launch(createScreenCaptureConsentIntent(projectionManager))
                         }
                     }
 
@@ -752,23 +669,24 @@ class MainActivity : ComponentActivity() {
                                             },
                                             onTrimChanged = { start, end ->
                                                 isEffectPreviewApplied = false
-                                                trimStartMs = start.coerceAtLeast(0L)
-                                                trimEndMs = end.coerceAtLeast(trimStartMs)
+                                                videoEditState = videoEditState.copy(
+                                                    trimStartMs = start.coerceAtLeast(0L),
+                                                    trimEndMs = end.coerceAtLeast(start.coerceAtLeast(0L)),
+                                                    sceneEffects = emptyList()
+                                                )
                                                 effectStartMs = 0L
-                                                effectEndMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
-                                                sceneEffects = emptyList()
-                                                appliedSceneEffects = emptyList()
+                                                effectEndMs = (videoEditState.trimEndMs - videoEditState.trimStartMs).coerceAtLeast(0L)
                                                 selectedSceneId = ""
                                             },
                                             onDurationChanged = { duration ->
                                                 if (duration > 0L && duration != sourceDurationMs) {
                                                     sourceDurationMs = duration
                                                     if (trimEndMs == 0L || trimEndMs > duration) {
-                                                        trimEndMs = duration
+                                                        videoEditState = videoEditState.copy(trimEndMs = duration)
                                                     }
                                                     if (effectEndMs == 0L) {
                                                         effectStartMs = 0L
-                                                        effectEndMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
+                                                        effectEndMs = (videoEditState.trimEndMs - videoEditState.trimStartMs).coerceAtLeast(0L)
                                                     }
                                                 }
                                             },
@@ -781,16 +699,12 @@ class MainActivity : ComponentActivity() {
                                         )
 
                                         RecorderDestination.EFFECTS -> EffectsScreen(
-                                            videoUri = selectedVideoUri,
-                                            startMs = trimStartMs,
-                                            endMs = trimEndMs,
+                                            editState = videoEditState,
                                             effectStartMs = effectStartMs,
                                             effectEndMs = effectEndMs,
                                             isPreviewApplied = isEffectPreviewApplied,
                                             previewRequestId = previewRequestId,
-                                            sceneEffects = sceneEffects,
                                             selectedSceneId = selectedSceneId,
-                                            appliedSceneEffects = appliedSceneEffects,
                                             playheadMs = playheadMs,
                                             onEffectRangeChanged = { start, end ->
                                                 isEffectPreviewApplied = false
@@ -800,7 +714,7 @@ class MainActivity : ComponentActivity() {
                                                     effectStartMs,
                                                     clipDuration
                                                 )
-                                                sceneEffects = sceneEffects.map { scene ->
+                                                videoEditState = videoEditState.copy(sceneEffects = sceneEffects.map { scene ->
                                                     if (scene.id == selectedSceneId) {
                                                         scene.copy(
                                                             startMs = effectStartMs,
@@ -811,11 +725,11 @@ class MainActivity : ComponentActivity() {
                                                             )
                                                         )
                                                     } else scene
-                                                }
+                                                })
                                             },
                                             onSceneEffectsChanged = {
                                                 isEffectPreviewApplied = false
-                                                sceneEffects = it
+                                                videoEditState = videoEditState.copy(sceneEffects = it)
                                                 it.firstOrNull { scene -> scene.id == selectedSceneId }?.let { scene ->
                                                     effectStartMs = scene.startMs
                                                     effectEndMs = scene.endMs
@@ -834,11 +748,11 @@ class MainActivity : ComponentActivity() {
                                                 if (duration > 0L && duration != sourceDurationMs) {
                                                     sourceDurationMs = duration
                                                     if (trimEndMs == 0L || trimEndMs > duration) {
-                                                        trimEndMs = duration
+                                                        videoEditState = videoEditState.copy(trimEndMs = duration)
                                                     }
                                                     if (effectEndMs == 0L) {
                                                         effectStartMs = 0L
-                                                        effectEndMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
+                                                        effectEndMs = (videoEditState.trimEndMs - videoEditState.trimStartMs).coerceAtLeast(0L)
                                                     }
                                                 }
                                             },
@@ -846,9 +760,9 @@ class MainActivity : ComponentActivity() {
                                             onOptionsChanged = {
                                                 isEffectPreviewApplied = false
                                                 effectOptions = it
-                                                sceneEffects = sceneEffects.map { scene ->
+                                                videoEditState = videoEditState.copy(sceneEffects = sceneEffects.map { scene ->
                                                     if (scene.id == selectedSceneId) scene.copy(options = it) else scene
-                                                }
+                                                })
                                             },
                                             onApplyPreview = {
                                                 if (sceneEffects.none {
@@ -859,7 +773,6 @@ class MainActivity : ComponentActivity() {
                                                     exportMessage = "Choose an effect for a scene before previewing"
                                                     return@EffectsScreen
                                                 }
-                                                appliedSceneEffects = sceneEffects
                                                 isEffectPreviewApplied = true
                                                 previewRequestId += 1
                                                 exportMessage = "Previewing all scene effects. Export when you are ready."
@@ -909,7 +822,6 @@ class MainActivity : ComponentActivity() {
                                                         )
                                                     )
                                                 },
-                                                onPrepareFloatingRecorder = ::prepareFloatingRecorder,
                                                 onResetSettings = {
                                                     settings = AppSettings()
                                                     settingsRepository.save(settings)
@@ -932,6 +844,18 @@ class MainActivity : ComponentActivity() {
     private fun shouldRequestNotificationPermission(): Boolean {
         return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun createScreenCaptureConsentIntent(
+        projectionManager: MediaProjectionManager
+    ): Intent {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            projectionManager.createScreenCaptureIntent(
+                MediaProjectionConfig.createConfigForUserChoice()
+            )
+        } else {
+            projectionManager.createScreenCaptureIntent()
+        }
     }
 
     private fun formatElapsed(seconds: Int): String {

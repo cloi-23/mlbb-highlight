@@ -38,7 +38,6 @@ fun RecordingSettingsScreen(
     appVersion: String,
     onChooseSaveLocation: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
-    onPrepareFloatingRecorder: () -> Unit,
     onResetSettings: () -> Unit
 ) {
     Card(
@@ -139,17 +138,6 @@ fun RecordingSettingsScreen(
             )
             androidx.compose.material3.TextButton(onClick = onRequestOverlayPermission) {
                 Text("Floating control permission")
-            }
-            Text(
-                "Prepare screen-capture permission here before leaving for MLBB. The floating Start button can then begin recording without reopening this screen.",
-                color = RecorderTheme.textSecondary,
-                style = MaterialTheme.typography.bodySmall
-            )
-            androidx.compose.material3.OutlinedButton(
-                onClick = onPrepareFloatingRecorder,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Prepare floating recorder")
             }
             IconSettingRow(
                 icon = Icons.Outlined.Language,

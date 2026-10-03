@@ -16,6 +16,12 @@
         android:theme="@style/Theme.MLBBHighlight">
 
         <activity
+            android:name=".recording.ProjectionConsentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
             android:name=".MainActivity"
             android:exported="true">
 

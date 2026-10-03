@@ -76,34 +76,6 @@ class ScreenCaptureService : Service() {
                 startProjection(resultCode, resultData)
             }
 
-            ACTION_PREPARE -> {
-                if (isReleasing || mediaProjection != null) return START_NOT_STICKY
-                recordingSettings = intent.toRecordingSettings()
-                if (recordingSettings.saveLocationUri == null) {
-                    sendCaptureStatus(errorMessage = "Choose a gallery save folder in Settings before recording")
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
-                val resultData = intent.getParcelableExtraCompat<Intent>(EXTRA_RESULT_DATA)
-                if (resultCode != Activity.RESULT_OK || resultData == null) {
-                    stopSelf()
-                    return START_NOT_STICKY
-                }
-                startForegroundForProjection()
-                prepareProjection(resultCode, resultData)
-            }
-
-            ACTION_START_PREPARED -> {
-                val projection = mediaProjection
-                if (projection == null || !isProjectionReady) {
-                    sendCaptureStatus(errorMessage = "Open the recorder and prepare floating capture first")
-                    return START_NOT_STICKY
-                }
-                if (isReleasing || isCapturing) return START_NOT_STICKY
-                startPreparedRecording(projection)
-            }
-
             ACTION_STOP -> {
                 releaseCapture(stopProjection = true)
             }
@@ -112,11 +84,6 @@ class ScreenCaptureService : Service() {
                 togglePause()
             }
 
-            ACTION_CANCEL_PREPARED -> {
-                if (!isCapturing && mediaProjection != null) {
-                    releaseCapture(stopProjection = true)
-                }
-            }
         }
 
         return START_NOT_STICKY
@@ -135,48 +102,29 @@ class ScreenCaptureService : Service() {
         if (mediaProjection != null) return
 
         val projectionManager = getSystemService(MediaProjectionManager::class.java)
-        val projection = projectionManager.getMediaProjection(resultCode, resultData)
+        val projection = try {
+            projectionManager.getMediaProjection(resultCode, resultData)
+        } catch (error: SecurityException) {
+            sendCaptureStatus(errorMessage = "Android rejected screen-capture permission. Tap Start and allow capture.")
+            stopSelf()
+            return
+        } catch (error: IllegalStateException) {
+            sendCaptureStatus(errorMessage = error.localizedMessage ?: "Screen capture is no longer available")
+            stopSelf()
+            return
+        }
 
         if (projection == null) {
+            sendCaptureStatus(errorMessage = "Android could not start screen capture. Tap Start to try again.")
             stopSelf()
             return
         }
 
         mediaProjection = projection
-        isProjectionReady = true
         isCapturing = true
         isPaused = false
         sendCaptureStatus()
         projection.registerCallback(projectionCallback, null)
-        try {
-            createVirtualDisplay(projection)
-        } catch (error: Exception) {
-            releaseCapture(stopProjection = true)
-            sendCaptureStatus(errorMessage = error.message ?: "Could not start recording with these settings")
-        }
-    }
-
-    private fun prepareProjection(resultCode: Int, resultData: Intent) {
-        val projection = getSystemService(MediaProjectionManager::class.java)
-            .getMediaProjection(resultCode, resultData)
-        if (projection == null) {
-            sendCaptureStatus(errorMessage = "Screen-capture permission could not be prepared")
-            stopSelf()
-            return
-        }
-        mediaProjection = projection
-        isProjectionReady = true
-        isCapturing = false
-        isPaused = false
-        projection.registerCallback(projectionCallback, null)
-        sendCaptureStatus()
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification())
-    }
-
-    private fun startPreparedRecording(projection: MediaProjection) {
-        isCapturing = true
-        isPaused = false
-        sendCaptureStatus()
         try {
             createVirtualDisplay(projection)
         } catch (error: Exception) {
@@ -262,7 +210,6 @@ class ScreenCaptureService : Service() {
 
         isCapturing = false
         isPaused = false
-        isProjectionReady = false
         sendCaptureStatus()
 
         val display = virtualDisplay
@@ -414,7 +361,6 @@ class ScreenCaptureService : Service() {
                 .setPackage(packageName)
                 .putExtra(EXTRA_IS_CAPTURING, isCapturing)
                 .putExtra(EXTRA_IS_PAUSED, isPaused)
-                .putExtra(EXTRA_IS_PREPARED, isProjectionReady)
                 .putExtra(EXTRA_RECORDING_URI, recordingUri?.toString())
                 .putExtra(EXTRA_ERROR_MESSAGE, errorMessage)
         )
@@ -477,7 +423,6 @@ class ScreenCaptureService : Service() {
                 when {
                     isPaused -> "Recording is paused"
                     isCapturing -> "Screen recording is running"
-                    isProjectionReady -> "Floating recorder is ready"
                     else -> "Screen recorder is ready"
                 }
             )
@@ -547,16 +492,12 @@ class ScreenCaptureService : Service() {
         private const val EXTRA_SAVE_LOCATION_URI = "extra_save_location_uri"
         const val EXTRA_IS_CAPTURING = "extra_is_capturing"
         const val EXTRA_IS_PAUSED = "extra_is_paused"
-        const val EXTRA_IS_PREPARED = "extra_is_prepared"
         const val EXTRA_ERROR_MESSAGE = "extra_error_message"
         const val EXTRA_RECORDING_URI = "extra_recording_uri"
 
         const val ACTION_START = "com.mlbb.highlight.recording.action.START"
         const val ACTION_STOP = "com.mlbb.highlight.recording.action.STOP"
         const val ACTION_PAUSE_RESUME = "com.mlbb.highlight.recording.action.PAUSE_RESUME"
-        const val ACTION_PREPARE = "com.mlbb.highlight.recording.action.PREPARE"
-        const val ACTION_START_PREPARED = "com.mlbb.highlight.recording.action.START_PREPARED"
-        const val ACTION_CANCEL_PREPARED = "com.mlbb.highlight.recording.action.CANCEL_PREPARED"
         const val ACTION_STATUS_CHANGED = "com.mlbb.highlight.recording.action.STATUS_CHANGED"
 
         @Volatile
@@ -564,9 +505,6 @@ class ScreenCaptureService : Service() {
             private set
         @Volatile
         var isPaused: Boolean = false
-            private set
-        @Volatile
-        var isProjectionReady: Boolean = false
             private set
 
         fun setCapturing(value: Boolean) {
@@ -589,27 +527,6 @@ class ScreenCaptureService : Service() {
                 putExtra(EXTRA_SAVE_LOCATION_URI, settings.saveLocationUri)
             }
         }
-
-        fun prepareIntent(
-            context: Context,
-            resultCode: Int,
-            resultData: Intent,
-            settings: AppSettings
-        ): Intent = Intent(context, ScreenCaptureService::class.java).apply {
-            action = ACTION_PREPARE
-            putExtra(EXTRA_RESULT_CODE, resultCode)
-            putExtra(EXTRA_RESULT_DATA, resultData)
-            putExtra(EXTRA_RESOLUTION_SHORT_EDGE, settings.resolutionShortEdge)
-            putExtra(EXTRA_FRAME_RATE, settings.frameRate)
-            putExtra(EXTRA_AUDIO_SOURCE, settings.audioSource.name)
-            putExtra(EXTRA_SAVE_LOCATION_URI, settings.saveLocationUri)
-        }
-
-        fun startPreparedIntent(context: Context): Intent =
-            Intent(context, ScreenCaptureService::class.java).setAction(ACTION_START_PREPARED)
-
-        fun cancelPreparedIntent(context: Context): Intent =
-            Intent(context, ScreenCaptureService::class.java).setAction(ACTION_CANCEL_PREPARED)
 
         fun stopIntent(context: Context): Intent {
             return Intent(context, ScreenCaptureService::class.java).apply {
