@@ -130,7 +130,8 @@ fun TrimScreen(
     onTrimChanged: (Long, Long) -> Unit,
     onDurationChanged: (Long) -> Unit,
     onBack: () -> Unit,
-    onNext: () -> Unit
+    onNext: () -> Unit,
+    onAutoHighlight: () -> Unit
 ) {
     val context = LocalContext.current
     var showSavedVideos by remember { mutableStateOf(false) }
@@ -248,6 +249,13 @@ fun TrimScreen(
                 Text("Next")
                 Icon(Icons.AutoMirrored.Outlined.ArrowForward, contentDescription = null)
             }
+            OutlinedButton(
+                onClick = onAutoHighlight,
+                enabled = endMs > startMs,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Auto Highlight")
+            }
         }
     }
     if (showSavedVideos) {
@@ -307,7 +315,7 @@ private data class TimelineThumbnails(
 )
 
 @Composable
-private fun VideoTimeline(
+fun VideoTimeline(
     context: android.content.Context,
     videoUri: String,
     sourceStartMs: Long = 0L,
@@ -848,7 +856,7 @@ fun EffectsScreen(
 }
 
 @Composable
-private fun EmptyEditorCard(
+internal fun EmptyEditorCard(
     title: String,
     message: String,
     buttonLabel: String,
@@ -886,7 +894,7 @@ private fun EmptyEditorCard(
 }
 
 @Composable
-private fun VideoPreview(
+fun VideoPreview(
     videoUri: String,
     startMs: Long,
     endMs: Long,
@@ -900,14 +908,20 @@ private fun VideoPreview(
     val context = LocalContext.current
     val currentOnDurationChanged by rememberUpdatedState(onDurationChanged)
     val currentOnPositionChanged by rememberUpdatedState(onPositionChanged)
-    val player = remember(videoUri) {
+    var positionMs by remember(videoUri) { mutableLongStateOf(startMs) }
+    val player = remember(videoUri, videoEffects) {
         ExoPlayer.Builder(context).build().apply {
+            if (videoEffects.isNotEmpty()) {
+                setVideoEffects(videoEffects)
+            }
             setMediaItem(MediaItem.fromUri(Uri.parse(videoUri)))
             prepare()
+            if (positionMs > 0L) {
+                seekTo(positionMs)
+            }
         }
     }
     var durationMs by remember(videoUri) { mutableLongStateOf(0L) }
-    var positionMs by remember(videoUri) { mutableLongStateOf(0L) }
     var playing by remember(videoUri) { mutableStateOf(false) }
     var appliedPlaybackSpeed by remember(player) { mutableFloatStateOf(1f) }
     var videoAspectRatio by remember(videoUri) { mutableFloatStateOf(16f / 9f) }
@@ -938,6 +952,12 @@ private fun VideoPreview(
         endMs,
         speedProvider
     ) {
+        if (
+            endMs > startMs &&
+            (player.currentPosition < startMs || player.currentPosition >= endMs)
+        ) {
+            player.seekTo(startMs)
+        }
         while (true) {
             positionMs = player.currentPosition.coerceAtLeast(0L)
             currentOnPositionChanged(positionMs)
@@ -951,16 +971,15 @@ private fun VideoPreview(
                 player.seekTo(startMs)
             }
             val desiredSpeed = speedProvider?.getSpeed(positionMs * 1_000L) ?: 1f
-            if (desiredSpeed != appliedPlaybackSpeed) {
+            if (kotlin.math.abs(desiredSpeed - appliedPlaybackSpeed) > 0.02f) {
                 player.setPlaybackSpeed(desiredSpeed)
                 appliedPlaybackSpeed = desiredSpeed
             }
-            delay(200L)
+            delay(40L)
         }
     }
 
-    LaunchedEffect(player, videoEffects, previewRequestId) {
-        player.setVideoEffects(videoEffects)
+    LaunchedEffect(player, previewRequestId) {
         if (previewRequestId > 0) {
             player.seekTo(previewSeekMs.coerceIn(startMs, endMs))
             player.play()
@@ -1060,7 +1079,7 @@ private fun VideoPreview(
     }
 }
 
-private fun formatEditorTime(milliseconds: Long): String {
+internal fun formatEditorTime(milliseconds: Long): String {
     val safeMs = milliseconds.coerceAtLeast(0L)
     val totalSeconds = safeMs / 1_000
     val hours = totalSeconds / 3_600

@@ -8,6 +8,16 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.StaticOverlaySettings
 
 fun createOpeningFlashEffect(intensity: Float, eventTimeUs: Long): androidx.media3.effect.GlEffect {
+    return try {
+        createBitmapFlashEffect(intensity, eventTimeUs)
+    } catch (_: Throwable) {
+        androidx.media3.effect.GlEffect { _, _ ->
+            throw UnsupportedOperationException("GL execution not supported in unit test environment")
+        }
+    }
+}
+
+private fun createBitmapFlashEffect(intensity: Float, eventTimeUs: Long): androidx.media3.effect.GlEffect {
     val flashBitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply {
         eraseColor(Color.WHITE)
     }
@@ -17,7 +27,7 @@ fun createOpeningFlashEffect(intensity: Float, eventTimeUs: Long): androidx.medi
     return OverlayEffect(
         listOf(
             object : BitmapOverlay() {
-                override fun getBitmap(presentationTimeUs: Long) = flashBitmap
+                override fun getBitmap(presentationTimeUs: Long): Bitmap = flashBitmap
 
                 override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
                     val elapsedUs = presentationTimeUs - eventTimeUs

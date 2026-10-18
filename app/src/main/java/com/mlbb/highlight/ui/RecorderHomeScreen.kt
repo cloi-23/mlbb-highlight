@@ -48,6 +48,7 @@ fun RecorderHomeScreen(
     onPauseResume: () -> Unit,
     onStop: () -> Unit,
     onOpenTrim: () -> Unit,
+    onOpenAutoHighlight: () -> Unit = onOpenTrim,
     onOpenEffects: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -150,6 +151,13 @@ fun RecorderHomeScreen(
             onStop = onStop
         )
 
+        FeatureCard(
+            title = "Auto Highlight",
+            subtitle = "Scan match recordings to detect\nkills and create an editable montage.",
+            icon = Icons.Outlined.AutoAwesome,
+            accent = RecorderTheme.cyan,
+            onClick = onOpenAutoHighlight
+        )
         FeatureCard(
             title = "Trim",
             subtitle = "Cut your gameplay and keep\nonly the best parts.",

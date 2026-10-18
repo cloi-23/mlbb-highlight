@@ -23,6 +23,7 @@ enum class RecorderDestination(val title: String) {
     VIDEOS("My Videos"),
     PROFILE("Profile"),
     TRIM("Trim"),
+    AUTO_HIGHLIGHT("Auto Highlight"),
     EFFECTS("Effects"),
     SETTINGS("Settings")
 }

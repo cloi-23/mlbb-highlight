@@ -11,10 +11,13 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
+import android.media.MediaMetadataRetriever
 import android.os.Build
 import android.provider.Settings
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -43,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -57,6 +61,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.audio.SpeedProvider
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Composition
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
@@ -64,10 +69,23 @@ import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import com.mlbb.highlight.recording.ScreenCaptureService
 import com.mlbb.highlight.recording.FloatingControlService
+import com.mlbb.highlight.detection.HudCalibrationStore
+import com.mlbb.highlight.detection.HudRegion
 import com.mlbb.highlight.settings.AppSettings
 import com.mlbb.highlight.settings.RecordingAudioSource
 import com.mlbb.highlight.settings.SettingsRepository
 import com.mlbb.highlight.storage.HighlightRepository
+import com.mlbb.highlight.highlight.AutoHighlightEngine
+import com.mlbb.highlight.highlight.HighlightAspectRatio
+import com.mlbb.highlight.highlight.HighlightEvent
+import com.mlbb.highlight.highlight.HighlightEventOrigin
+import com.mlbb.highlight.highlight.HighlightEventType
+import com.mlbb.highlight.highlight.HighlightResolution
+import com.mlbb.highlight.highlight.HighlightStyle
+import com.mlbb.highlight.highlight.HighlightTimeline
+import com.mlbb.highlight.highlight.buildHighlightComposition
+import com.mlbb.highlight.highlight.effectPreset
+import com.mlbb.highlight.ui.AutoHighlightScreen
 import com.mlbb.highlight.ui.HighlightsScreen
 import com.mlbb.highlight.ui.RecorderBottomNavigation
 import com.mlbb.highlight.ui.RecorderDestination
@@ -83,7 +101,9 @@ import com.mlbb.highlight.ui.VideoEditState
 import com.mlbb.highlight.ui.EffectTimestampBasis
 import com.mlbb.highlight.ui.buildVideoEffects
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicReference
+import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private var overlayPermissionRequested = false
@@ -166,12 +186,62 @@ class MainActivity : ComponentActivity() {
                     var playheadMs by rememberSaveable { mutableStateOf(0L) }
                     var isEffectPreviewApplied by rememberSaveable { mutableStateOf(false) }
                     var previewRequestId by rememberSaveable { mutableStateOf(0) }
+                    var highlightEvents by remember { mutableStateOf(emptyList<HighlightEvent>()) }
+                    var highlightScanResult by remember {
+                        mutableStateOf<AutoHighlightEngine.HighlightScanResult?>(null)
+                    }
+                    var highlightTimeline by remember { mutableStateOf<HighlightTimeline?>(null) }
+                    var highlightStyle by rememberSaveable { mutableStateOf(HighlightStyle.CINEMATIC) }
+                    var isAnalyzingHighlights by remember { mutableStateOf(false) }
+                    var highlightAnalysisMessage by remember { mutableStateOf<String?>(null) }
                     var isExporting by remember { mutableStateOf(false) }
                     var exportProgress by remember { mutableStateOf(0f) }
                     var exportMessage by remember { mutableStateOf<String?>(null) }
+                    var previewOutputFile by remember { mutableStateOf<File?>(null) }
                     val activeTransformer = remember { AtomicReference<Transformer?>(null) }
                     val activeOutputFile = remember { AtomicReference<File?>(null) }
                     val progressHolder = remember { ProgressHolder() }
+                    val screenScope = rememberCoroutineScope()
+                    val autoHighlightEngine = remember { AutoHighlightEngine() }
+                    val hudCalibrationStore = remember { HudCalibrationStore(applicationContext) }
+                    var hudRegion by remember { mutableStateOf(hudCalibrationStore.load()) }
+
+                    fun selectEditorVideo(uri: Uri) {
+                        videoEditState = VideoEditState(sourceVideoUri = uri.toString())
+                        highlightEvents = emptyList()
+                        highlightScanResult = null
+                        highlightTimeline = null
+                        highlightAnalysisMessage = null
+                        highlightStyle = HighlightStyle.CINEMATIC
+                        sourceDurationMs = 0L
+                        effectStartMs = 0L
+                        effectEndMs = 0L
+                        effectOptions = VideoEffectOptions()
+                        selectedSceneId = ""
+                        playheadMs = 0L
+                        isEffectPreviewApplied = false
+                        exportMessage = null
+                        screenScope.launch(Dispatchers.IO) {
+                            try {
+                                val retriever = MediaMetadataRetriever()
+                                retriever.setDataSource(applicationContext, uri)
+                                val duration = retriever.extractMetadata(
+                                    MediaMetadataRetriever.METADATA_KEY_DURATION
+                                )?.toLongOrNull() ?: 0L
+                                retriever.release()
+                                if (duration > 0L) {
+                                    withContext(Dispatchers.Main) {
+                                        sourceDurationMs = duration
+                                        videoEditState = videoEditState.copy(
+                                            trimStartMs = 0L,
+                                            trimEndMs = duration
+                                        )
+                                        effectEndMs = duration
+                                    }
+                                }
+                            } catch (_: Exception) {}
+                        }
+                    }
 
                     val videoPickerLauncher = rememberLauncherForActivityResult(
                         contract = ActivityResultContracts.OpenDocument()
@@ -185,15 +255,7 @@ class MainActivity : ComponentActivity() {
                             } catch (exception: SecurityException) {
                                 statusMessage = "Video selected, but Android could not keep access after closing the app"
                             }
-                            videoEditState = VideoEditState(sourceVideoUri = uri.toString())
-                            sourceDurationMs = 0L
-                            effectStartMs = 0L
-                            effectEndMs = 0L
-                            effectOptions = VideoEffectOptions()
-                            selectedSceneId = ""
-                            playheadMs = 0L
-                            isEffectPreviewApplied = false
-                            exportMessage = null
+                            selectEditorVideo(uri)
                         }
                     }
                     val folderPickerLauncher = rememberLauncherForActivityResult(
@@ -214,56 +276,334 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    val musicPickerLauncher = rememberLauncherForActivityResult(
+                        contract = ActivityResultContracts.OpenDocument()
+                    ) { uri ->
+                        if (uri != null) {
+                            try {
+                                contentResolver.takePersistableUriPermission(
+                                    uri,
+                                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                )
+                                highlightTimeline = highlightTimeline?.copy(
+                                    musicUri = uri.toString(),
+                                    musicVolume = highlightTimeline?.musicVolume ?: 0.2f
+                                )
+                                isEffectPreviewApplied = false
+                                exportMessage = "Music track added. Preview the highlight before exporting."
+                            } catch (exception: SecurityException) {
+                                exportMessage = "Android could not keep access to that music file"
+                            }
+                        }
+                    }
 
-                    fun selectEditorVideo(uri: Uri) {
-                        videoEditState = VideoEditState(sourceVideoUri = uri.toString())
-                        sourceDurationMs = 0L
-                        effectStartMs = 0L
-                        effectEndMs = 0L
-                        effectOptions = VideoEffectOptions()
-                        selectedSceneId = ""
-                        playheadMs = 0L
+                    fun analyzeAutoHighlight(style: HighlightStyle) {
+                        val source = selectedVideoUri?.let(Uri::parse)
+                        if (source == null) {
+                            highlightAnalysisMessage = "Choose a video first"
+                            return
+                        }
+                        var effectiveStartMs = trimStartMs
+                        var effectiveEndMs = trimEndMs
+                        if (effectiveEndMs <= effectiveStartMs) {
+                            try {
+                                val retriever = MediaMetadataRetriever()
+                                retriever.setDataSource(applicationContext, source)
+                                val duration = retriever.extractMetadata(
+                                    MediaMetadataRetriever.METADATA_KEY_DURATION
+                                )?.toLongOrNull() ?: 0L
+                                retriever.release()
+                                if (duration > 0L) {
+                                    effectiveStartMs = 0L
+                                    effectiveEndMs = duration
+                                    sourceDurationMs = duration
+                                    videoEditState = videoEditState.copy(
+                                        trimStartMs = 0L,
+                                        trimEndMs = duration
+                                    )
+                                    effectEndMs = duration
+                                }
+                            } catch (_: Exception) {}
+                        }
+                        if (effectiveEndMs <= effectiveStartMs) {
+                            highlightAnalysisMessage = "Could not determine video duration"
+                            return
+                        }
+                        highlightStyle = style
+                        isAnalyzingHighlights = true
+                        highlightScanResult = null
+                        highlightEvents = emptyList()
+                        highlightAnalysisMessage =
+                            "Analyzing the calibrated K/D/A region and kill-feed context…"
+                        screenScope.launch {
+                            try {
+                                val scanResult = autoHighlightEngine.analyze(
+                                    context = applicationContext,
+                                    sourceUri = source,
+                                    trimStartMs = effectiveStartMs,
+                                    trimEndMs = effectiveEndMs,
+                                    hudRegion = hudRegion
+                                )
+                                highlightScanResult = scanResult
+                                val events = scanResult.events
+                                highlightEvents = events
+                                val previous = highlightTimeline
+                                highlightTimeline = autoHighlightEngine.createTimeline(
+                                    sourceUri = source.toString(),
+                                    trimStartMs = effectiveStartMs,
+                                    trimEndMs = effectiveEndMs,
+                                    events = events,
+                                    style = style
+                                ).copy(
+                                    aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.VERTICAL,
+                                    resolution = previous?.resolution ?: HighlightResolution.P1080,
+                                    musicUri = previous?.musicUri,
+                                    musicVolume = previous?.musicVolume ?: 0.2f
+                                )
+                                isEffectPreviewApplied = false
+                                val baseline = scanResult.baselineKda
+                                val current = scanResult.finalKda
+                                val kdaMessage = if (baseline != null && current != null) {
+                                    "My K/D/A: ${baseline.kills}/${baseline.deaths}/${baseline.assists} → " +
+                                        "${current.kills}/${current.deaths}/${current.assists}. "
+                                } else {
+                                    "Could not establish a clear personal K/D/A baseline. "
+                                }
+                                highlightAnalysisMessage = when {
+                                    events.isNotEmpty() ->
+                                        "$kdaMessage Found ${events.size} moment(s) only after my kill count increased."
+                                    baseline == null ->
+                                        "Could not confidently read all three K/D/A values in the upper-right HUD. " +
+                                            "Shop gold and kill-feed banners are ignored; mark moments manually."
+                                    else ->
+                                        "$kdaMessage My kill count never increased. " +
+                                            "Death/assist changes and kill-feed banners did not create highlights."
+                                }
+                                selectedDestination = RecorderDestination.AUTO_HIGHLIGHT.name
+                            } catch (exception: IllegalArgumentException) {
+                                highlightAnalysisMessage =
+                                    "Could not analyze this trim range: ${exception.localizedMessage ?: "invalid range"}"
+                            } catch (exception: IOException) {
+                                highlightAnalysisMessage =
+                                    "Could not read the selected video: ${exception.localizedMessage ?: "storage error"}"
+                            } catch (exception: SecurityException) {
+                                highlightAnalysisMessage = "Android denied access to the selected video"
+                            } catch (exception: com.google.mlkit.common.MlKitException) {
+                                highlightAnalysisMessage =
+                                    "OCR analysis failed: ${exception.localizedMessage ?: "recognizer error"}"
+                            } finally {
+                                isAnalyzingHighlights = false
+                            }
+                        }
+                    }
+
+                    fun addManualHighlightMoment(sourceTimeMs: Long) {
+                        val source = selectedVideoUri
+                        val effectiveStartMs = trimStartMs
+                        val effectiveEndMs = if (trimEndMs > trimStartMs) trimEndMs else (sourceDurationMs.takeIf { it > 0L } ?: (sourceTimeMs + 10_000L))
+                        if (source == null || effectiveEndMs <= effectiveStartMs) return
+                        val eventTimeMs = sourceTimeMs.coerceIn(effectiveStartMs, effectiveEndMs - 1L)
+                        val event = HighlightEvent(
+                            id = UUID.randomUUID().toString(),
+                            type = HighlightEventType.MANUAL_MOMENT,
+                            sourceTimeMs = eventTimeMs,
+                            confidence = 1f,
+                            origin = HighlightEventOrigin.MANUAL
+                        )
+                        val events = (highlightEvents + event).sortedBy(HighlightEvent::sourceTimeMs)
+                        highlightEvents = events
+                        val previous = highlightTimeline
+                        highlightTimeline = autoHighlightEngine.createTimeline(
+                            sourceUri = source,
+                            trimStartMs = effectiveStartMs,
+                            trimEndMs = effectiveEndMs,
+                            events = events,
+                            style = highlightStyle
+                        ).copy(
+                            aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.LANDSCAPE,
+                            resolution = previous?.resolution ?: HighlightResolution.P1080,
+                            musicUri = previous?.musicUri,
+                            musicVolume = previous?.musicVolume ?: 0.13f
+                        )
+                        highlightAnalysisMessage = "Moment marked manually. It is not an automatic event detection."
                         isEffectPreviewApplied = false
-                        exportMessage = null
+                    }
+
+                    fun startHighlightPreview() {
+                        val timeline = highlightTimeline?.takeIf {
+                            it.sourceUri == selectedVideoUri &&
+                                it.sourceTrimStartMs == trimStartMs &&
+                                it.sourceTrimEndMs == trimEndMs
+                        }
+                        if (timeline == null || isExporting) {
+                            exportMessage = "Generate at least one valid moment before previewing"
+                            return
+                        }
+                        val composition = try {
+                            val comp = buildHighlightComposition(timeline, settings)
+                            val validation = com.mlbb.highlight.highlight.validateHighlightComposition(timeline, comp, settings)
+                            if (!validation.isValid) {
+                                exportMessage = "Preview validation: ${validation.issues.joinToString()}"
+                            }
+                            comp
+                        } catch (exception: IllegalArgumentException) {
+                            exportMessage = "Could not prepare preview: " +
+                                (exception.localizedMessage ?: "invalid timeline")
+                            return
+                        }
+                        val outputFile = highlightRepository.createPreviewOutputFile()
+                        val transformer = Transformer.Builder(applicationContext)
+                            .setVideoMimeType(MimeTypes.VIDEO_H264)
+                            .addListener(
+                                object : Transformer.Listener {
+                                    override fun onCompleted(
+                                        composition: Composition,
+                                        exportResult: ExportResult
+                                    ) {
+                                        activeTransformer.set(null)
+                                        activeOutputFile.set(null)
+                                        isExporting = false
+                                        if (!outputFile.isFile || outputFile.length() == 0L) {
+                                            outputFile.delete()
+                                            exportMessage = "Preview finished without a playable video"
+                                            return
+                                        }
+                                        try {
+                                            previewOutputFile?.delete()
+                                            previewOutputFile = outputFile
+                                            playbackVideoTitle = "Auto Highlight preview"
+                                            playbackVideoUri = videoUriFor(outputFile.absolutePath).toString()
+                                            isEffectPreviewApplied = true
+                                            exportMessage =
+                                                "Preview complete. Review it, then return to edit or export."
+                                        } catch (exception: IllegalArgumentException) {
+                                            outputFile.delete()
+                                            exportMessage = "Could not open the rendered preview: " +
+                                                (exception.localizedMessage ?: "invalid output")
+                                        }
+                                    }
+
+                                    override fun onError(
+                                        composition: Composition,
+                                        exportResult: ExportResult,
+                                        exportException: ExportException
+                                    ) {
+                                        activeTransformer.set(null)
+                                        activeOutputFile.set(null)
+                                        isExporting = false
+                                        outputFile.delete()
+                                        exportMessage =
+                                            "Preview failed (${exportException.errorCodeName}): " +
+                                                (exportException.cause?.localizedMessage
+                                                    ?: exportException.localizedMessage
+                                                    ?: "unsupported video or effect")
+                                    }
+                                }
+                            )
+                            .build()
+                        activeTransformer.set(transformer)
+                        activeOutputFile.set(outputFile)
+                        isExporting = true
+                        isEffectPreviewApplied = false
+                        exportProgress = 0f
+                        exportMessage = "Rendering full highlight preview…"
+                        try {
+                            transformer.start(composition, outputFile.absolutePath)
+                        } catch (exception: IllegalArgumentException) {
+                            activeTransformer.set(null)
+                            activeOutputFile.set(null)
+                            isExporting = false
+                            outputFile.delete()
+                            exportMessage = "Could not render preview: " +
+                                (exception.localizedMessage ?: "invalid timeline")
+                        } catch (exception: IllegalStateException) {
+                            activeTransformer.set(null)
+                            activeOutputFile.set(null)
+                            isExporting = false
+                            outputFile.delete()
+                            exportMessage = "Could not start preview: " +
+                                (exception.localizedMessage ?: "exporter is unavailable")
+                        }
                     }
 
                     fun startExport() {
                         val inputUri = videoEditState.sourceVideoUri?.let(Uri::parse)
                         val exportScenes = videoEditState.exportableSceneEffects
-                        if (
-                            inputUri == null ||
-                            trimEndMs <= trimStartMs ||
-                            settings.saveLocationUri == null ||
-                            exportScenes.isEmpty() ||
-                            !isEffectPreviewApplied ||
-                            isExporting
-                        ) {
+                        val isAutoHighlightExport =
+                            selectedDestination == RecorderDestination.AUTO_HIGHLIGHT.name
+                        val currentTimeline = highlightTimeline?.takeIf {
+                            it.sourceUri == selectedVideoUri &&
+                                it.sourceTrimStartMs == trimStartMs &&
+                                it.sourceTrimEndMs == trimEndMs
+                        }
+                        if (isExporting) return
+                        if (settings.saveLocationUri == null) {
+                            exportMessage = "Choose a gallery folder in Settings before exporting"
+                            return
+                        }
+                        if (inputUri == null || trimEndMs <= trimStartMs) {
+                            exportMessage = "Choose a video and a valid trim range before exporting"
+                            return
+                        }
+                        if (isAutoHighlightExport && currentTimeline == null) {
+                            exportMessage = "Generate or mark at least one highlight moment first"
+                            return
+                        }
+                        if (!isAutoHighlightExport && exportScenes.isEmpty()) {
+                            exportMessage = "Choose an effect for a scene before exporting"
+                            return
+                        }
+                        if (!isEffectPreviewApplied) {
                             exportMessage = if (settings.saveLocationUri == null) {
                                 "Choose a gallery folder in Settings before exporting"
                             } else {
-                                "Preview a scene effect before exporting"
+                                "Preview the edit before exporting"
                             }
                             return
                         }
 
+                        val autoComposition = if (isAutoHighlightExport) {
+                            try {
+                                val timelineToExport = currentTimeline ?: throw IllegalArgumentException(
+                                    "Generate or mark at least one highlight moment first"
+                                )
+                                val comp = buildHighlightComposition(timelineToExport, settings)
+                                val validation = com.mlbb.highlight.highlight.validateHighlightComposition(timelineToExport, comp, settings)
+                                if (!validation.isValid) {
+                                    exportMessage = "Validation issue: ${validation.issues.joinToString()}"
+                                    return
+                                }
+                                comp
+                            } catch (exception: IllegalArgumentException) {
+                                exportMessage = "Could not prepare highlight export: " +
+                                    (exception.localizedMessage ?: "invalid timeline")
+                                return
+                            }
+                        } else {
+                            null
+                        }
                         val outputFile = highlightRepository.createEditedOutputFile()
-                        val effectPipeline = buildVideoEffects(
-                            videoEditState,
-                            EffectTimestampBasis.CLIPPED_VIDEO
-                        )
-                        val mediaItem = MediaItem.Builder()
-                            .setUri(inputUri)
-                            .setClippingConfiguration(
-                                MediaItem.ClippingConfiguration.Builder()
-                                    .setStartPositionMs(trimStartMs)
-                                    .setEndPositionMs(trimEndMs)
-                                    .build()
+                        val editedItem = if (autoComposition == null) {
+                            val effectPipeline = buildVideoEffects(
+                                videoEditState,
+                                EffectTimestampBasis.CLIPPED_VIDEO
                             )
-                            .build()
-                        val editedItemBuilder = EditedMediaItem.Builder(mediaItem)
-                            .setEffects(Effects(emptyList(), effectPipeline.videoEffects))
-                        effectPipeline.speedProvider?.let(editedItemBuilder::setSpeed)
-                        val editedItem = editedItemBuilder.build()
+                            val mediaItem = MediaItem.Builder()
+                                .setUri(inputUri)
+                                .setClippingConfiguration(
+                                    MediaItem.ClippingConfiguration.Builder()
+                                        .setStartPositionMs(trimStartMs)
+                                        .setEndPositionMs(trimEndMs)
+                                        .build()
+                                )
+                                .build()
+                            val editedItemBuilder = EditedMediaItem.Builder(mediaItem)
+                                .setEffects(Effects(emptyList(), effectPipeline.videoEffects))
+                            effectPipeline.speedProvider?.let(editedItemBuilder::setSpeed)
+                            editedItemBuilder.build()
+                        } else {
+                            null
+                        }
 
                         val transformer = Transformer.Builder(applicationContext)
                             .setVideoMimeType(MimeTypes.VIDEO_H264)
@@ -335,7 +675,14 @@ class MainActivity : ComponentActivity() {
                         exportProgress = 0f
                         exportMessage = "Preparing MP4 export…"
                         try {
-                            transformer.start(editedItem, outputFile.absolutePath)
+                            if (autoComposition != null) {
+                                transformer.start(autoComposition, outputFile.absolutePath)
+                            } else {
+                                transformer.start(
+                                    editedItem ?: throw IllegalStateException("Missing export item"),
+                                    outputFile.absolutePath
+                                )
+                            }
                         } catch (exception: IllegalArgumentException) {
                             activeTransformer.set(null)
                             activeOutputFile.set(null)
@@ -473,6 +820,7 @@ class MainActivity : ComponentActivity() {
                         onDispose {
                             activeTransformer.getAndSet(null)?.cancel()
                             activeOutputFile.getAndSet(null)?.delete()
+                            previewOutputFile?.delete()
                         }
                     }
 
@@ -582,7 +930,16 @@ class MainActivity : ComponentActivity() {
                                     com.mlbb.highlight.ui.VideoPlaybackScreen(
                                         title = playbackVideoTitle,
                                         videoUri = playbackVideoUri!!,
-                                        onBack = { playbackVideoUri = null },
+                                        onBack = {
+                                            playbackVideoUri = null
+                                            previewOutputFile?.let { previewFile ->
+                                                if (!previewFile.delete()) {
+                                                    exportMessage =
+                                                        "Preview closed, but its temporary video could not be removed"
+                                                }
+                                            }
+                                            previewOutputFile = null
+                                        },
                                         modifier = Modifier.fillMaxSize()
                                     )
                                 } else if (showVideos) {
@@ -645,6 +1002,9 @@ class MainActivity : ComponentActivity() {
                                             onOpenTrim = {
                                                 selectedDestination = RecorderDestination.TRIM.name
                                             },
+                                            onOpenAutoHighlight = {
+                                                selectedDestination = RecorderDestination.AUTO_HIGHLIGHT.name
+                                            },
                                             onOpenEffects = {
                                                 selectedDestination = RecorderDestination.EFFECTS.name
                                             },
@@ -669,6 +1029,10 @@ class MainActivity : ComponentActivity() {
                                             },
                                             onTrimChanged = { start, end ->
                                                 isEffectPreviewApplied = false
+                                                highlightEvents = emptyList()
+                                                highlightScanResult = null
+                                                highlightTimeline = null
+                                                highlightAnalysisMessage = null
                                                 videoEditState = videoEditState.copy(
                                                     trimStartMs = start.coerceAtLeast(0L),
                                                     trimEndMs = end.coerceAtLeast(start.coerceAtLeast(0L)),
@@ -695,6 +1059,134 @@ class MainActivity : ComponentActivity() {
                                             },
                                             onNext = {
                                                 selectedDestination = RecorderDestination.EFFECTS.name
+                                            },
+                                            onAutoHighlight = {
+                                                highlightAnalysisMessage = null
+                                                selectedDestination = RecorderDestination.AUTO_HIGHLIGHT.name
+                                            }
+                                        )
+
+                                        RecorderDestination.AUTO_HIGHLIGHT -> AutoHighlightScreen(
+                                            videoUri = selectedVideoUri,
+                                            trimStartMs = trimStartMs,
+                                            trimEndMs = trimEndMs,
+                                            timeline = highlightTimeline,
+                                            detectedEvents = highlightEvents,
+                                            scanResult = highlightScanResult,
+                                            hudRegion = hudRegion,
+                                            isAnalyzing = isAnalyzingHighlights,
+                                            analysisMessage = highlightAnalysisMessage,
+                                            isPreviewReady = isEffectPreviewApplied,
+                                            isExporting = isExporting,
+                                            exportProgress = exportProgress,
+                                            exportMessage = exportMessage,
+                                            onAnalyze = ::analyzeAutoHighlight,
+                                            onHudRegionChanged = { region ->
+                                                hudRegion = region
+                                                hudCalibrationStore.save(region)
+                                                highlightScanResult = null
+                                                highlightAnalysisMessage =
+                                                    "HUD region updated. Run Auto Highlight to rescan using this calibration."
+                                            },
+                                            onManualMark = ::addManualHighlightMoment,
+                                            onAcceptReview = { review ->
+                                                val source = selectedVideoUri
+                                                val effectiveStartMs = trimStartMs
+                                                val effectiveEndMs = if (trimEndMs > trimStartMs) trimEndMs else (sourceDurationMs.takeIf { it > 0L } ?: (review.sourceTimeMs + 10_000L))
+                                                if (source != null && effectiveEndMs > effectiveStartMs) {
+                                                    val eventTimeMs = review.sourceTimeMs.coerceIn(effectiveStartMs, effectiveEndMs - 1L)
+                                                    val event = HighlightEvent(
+                                                        id = UUID.randomUUID().toString(),
+                                                        type = HighlightEventType.KILL,
+                                                        sourceTimeMs = eventTimeMs,
+                                                        confidence = review.confidence,
+                                                        origin = HighlightEventOrigin.OCR
+                                                    )
+                                                    val events = (highlightEvents + event).sortedBy(HighlightEvent::sourceTimeMs)
+                                                    highlightEvents = events
+                                                    val previous = highlightTimeline
+                                                    highlightTimeline = autoHighlightEngine.createTimeline(
+                                                        sourceUri = source,
+                                                        trimStartMs = effectiveStartMs,
+                                                        trimEndMs = effectiveEndMs,
+                                                        events = events,
+                                                        style = highlightStyle
+                                                    ).copy(
+                                                        aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.VERTICAL,
+                                                        resolution = previous?.resolution ?: HighlightResolution.P1080,
+                                                        musicUri = previous?.musicUri,
+                                                        musicVolume = previous?.musicVolume ?: 0.2f
+                                                    )
+                                                    highlightScanResult = highlightScanResult?.let { result ->
+                                                        result.copy(
+                                                            reviewDetections = result.reviewDetections.filterNot { it.id == review.id }
+                                                        )
+                                                    }
+                                                    highlightAnalysisMessage = "Reviewed moment added to highlight montage."
+                                                    isEffectPreviewApplied = false
+                                                }
+                                            },
+                                            onDismissReview = { reviewId ->
+                                                highlightScanResult = highlightScanResult?.let { result ->
+                                                    result.copy(
+                                                        reviewDetections = result.reviewDetections
+                                                            .filterNot { it.id == reviewId }
+                                                    )
+                                                }
+                                            },
+                                            onClipChanged = { updated ->
+                                                highlightTimeline = highlightTimeline?.let { timeline ->
+                                                    timeline.copy(
+                                                        clips = timeline.clips.map { clip ->
+                                                            if (clip.id == updated.id) updated else clip
+                                                        }
+                                                    )
+                                                }
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onClipRemoved = { removed ->
+                                                highlightTimeline = highlightTimeline?.let { timeline ->
+                                                    timeline.copy(
+                                                        clips = timeline.clips.filterNot { it.id == removed.id }
+                                                    )
+                                                }
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onStyleChanged = { style ->
+                                                highlightStyle = style
+                                                highlightTimeline = highlightTimeline?.let { timeline ->
+                                                    timeline.copy(
+                                                        style = style,
+                                                        clips = timeline.clips.map { clip ->
+                                                            clip.primaryEvent?.let { event ->
+                                                                clip.copy(effectPreset = event.type.effectPreset(style))
+                                                            } ?: clip
+                                                        }
+                                                    )
+                                                }
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onAspectRatioChanged = { ratio ->
+                                                highlightTimeline = highlightTimeline?.copy(aspectRatio = ratio)
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onResolutionChanged = { resolution ->
+                                                highlightTimeline = highlightTimeline?.copy(resolution = resolution)
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onChooseMusic = {
+                                                musicPickerLauncher.launch(arrayOf("audio/*"))
+                                            },
+                                            onMusicVolumeChanged = { volume ->
+                                                highlightTimeline = highlightTimeline?.copy(
+                                                    musicVolume = volume.coerceIn(0f, 1f)
+                                                )
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onPreview = ::startHighlightPreview,
+                                            onExport = ::startExport,
+                                            onBack = {
+                                                selectedDestination = RecorderDestination.TRIM.name
                                             }
                                         )
 

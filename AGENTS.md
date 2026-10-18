@@ -1,431 +1,103 @@
-AGENTS.md
-
-Project: MLBB Automatic Highlights / Replay App
-
-Build an Android application that automatically captures and saves highlights from Mobile Legends: Bang Bang (MLBB) gameplay.
-
-The core idea is similar to a gaming highlight/replay application:
-
-1. The app continuously captures gameplay using Android screen recording.
-2. It maintains a rolling/replay buffer of recent gameplay.
-3. When an important event is detected or the user triggers an event:
-   - Keep the gameplay from before the event.
-   - Continue recording briefly after the event.
-   - Combine the relevant section into a highlight clip.
-4. Eventually use computer vision/OCR/ML to automatically detect MLBB events.
-
----
-
-1. Main Goal
-
-Create an Android app that can produce clips like:
-
-MLBB gameplay
-↓
-Continuous screen capture
-↓
-30-second rolling buffer
-↓
-Event detected
-↓
-Save previous gameplay +
-Continue recording after event
-↓
-Generate highlight.mp4
-
-Example:
-
-If an event happens at:
-
-10:05:00
-
-The application should be able to save:
-
-10:04:40 → 10:05:10
-
-That means:
-
-- 20 seconds before the event
-- 10 seconds after the event
-
-The exact buffer duration should be configurable.
-
----
-
-2. Important Requirement: Replay Buffer
-
-The application MUST NOT wait until an event happens before starting capture.
-
-It must continuously maintain a rolling buffer.
-
-Example:
-
-[10:03:00]
-[10:03:05]
-[10:03:10]
-[10:03:15]
-[10:03:20]
-[10:03:25]
-[10:03:30]
-↓
-oldest segments are removed
-
-If the buffer is configured for 30 seconds, only the latest 30 seconds need to remain available.
-
-When an event happens:
-
-Event = 10:03:30
-
-Save:
-
-10:03:10 ───────────── 10:03:40
-↑ ↑
-before after
-
-Do NOT store an unlimited amount of gameplay.
-
----
-
-3. Android Technology
-
-Prefer modern Android development.
-
-Recommended:
-
-- Kotlin
-- Android Studio
-- Jetpack Compose for UI
-- Android MediaProjection for screen capture
-- MediaCodec / MediaMuxer where appropriate
-- Android Media3 where useful
-- Coroutines
-- Foreground Service for long-running screen capture
-- Room/DataStore for local configuration if needed
-
-Do not use deprecated Android APIs when a modern alternative exists.
-
-Before implementing screen recording, verify current Android restrictions and permissions.
-
----
-
-4. Capture Architecture
-
-Expected architecture:
-
-MLBB
-↓
-Android Screen
-↓
-MediaProjection
-↓
-Video Encoder
-↓
-Short Video Segments
-↓
-Rolling Buffer
-↓
-Event Trigger
-↓
-Clip Builder
-↓
-Highlight MP4
-
-The recording service should run independently from the main UI.
-
-Suggested components:
-
-app/
-├── ui/
-│ ├── HomeScreen
-│ ├── SettingsScreen
-│ └── HighlightsScreen
-│
-├── recording/
-│ ├── ScreenCaptureService
-│ ├── VideoEncoder
-│ ├── SegmentManager
-│ └── ReplayBuffer
-│
-├── highlight/
-│ ├── HighlightManager
-│ ├── ClipBuilder
-│ └── EventTrigger
-│
-├── detection/
-│ ├── OcrDetector
-│ ├── MlDetector
-│ └── EventClassifier
-│
-└── storage/
-├── HighlightRepository
-└── SettingsRepository
-
-Adjust the structure if a better architecture is appropriate.
-
----
-
-5. First MVP
-
-Do NOT start with AI.
-
-The first version should prove that the replay-buffer system works.
-
-MVP requirements:
-
-A. Start/Stop capture
-
-User can start and stop screen capture.
-
-B. Replay buffer
-
-Maintain a configurable rolling buffer.
-
-Default:
-
-Buffer: 30 seconds
-
-C. Manual highlight button
-
-Provide a floating/overlay button or another appropriate mechanism.
-
-When the user presses:
-
-HIGHLIGHT
-
-the app should:
-
-save previous 20 seconds
-
-- # record next 10 seconds
-  30-second highlight
-
-D. Save video
-
-Save the resulting clip locally as MP4.
-
-Example:
-
-Highlights/
-highlight_2026-09-14_10-05-23.mp4
-
-E. Highlight list
-
-Show saved highlights in the application.
-
-The user should be able to:
-
-- Play
-- Delete
-- Share
-
-Do not implement ML/AI until this MVP is working reliably.
-
----
-
-6. Segment-Based Replay Buffer
-
-Prefer a segment-based implementation instead of trying to keep an entire encoded video in RAM.
-
-For example:
-
-segment_001.mp4
-segment_002.mp4
-segment_003.mp4
-segment_004.mp4
-segment_005.mp4
-segment_006.mp4
-
-Each segment could be approximately 2–5 seconds.
-
-The application maintains only enough segments to cover the configured replay duration.
-
-For a 30-second buffer:
-
-5-second segments
-
-segment 1
-segment 2
-segment 3
-segment 4
-segment 5
-segment 6
-
-When a new segment is created:
-
-new segment
-↓
-add to buffer
-↓
-remove oldest segments
-↓
-keep approximately 30 seconds
-
-Avoid unnecessary RAM usage.
-
----
-
-7. Important: Event Timing
-
-When an event occurs, the system needs two phases.
-
-Phase 1: Previous footage
-
-Immediately identify the segments that existed before the event.
-
-Example:
-
-eventTime = 10:05:00
-
-preEventDuration = 20 seconds
-postEventDuration = 10 seconds
-
-Phase 2: Future footage
-
-Continue capturing for 10 seconds after the event.
-
-Then create the final clip.
-
-PREVIOUS BUFFER +
-POST EVENT
-↓
-ClipBuilder
-↓
-highlight.mp4
-
-Multiple highlight requests should be handled safely.
-
-Do not corrupt the recording service if two events happen close together.
-
----
-
-8. Future Automatic Detection
-
-After the manual replay system works, add automatic detection.
-
-Potential MLBB events:
-
-FIRST BLOOD
-KILL
-DOUBLE KILL
-TRIPLE KILL
-MANIAC
-SAVAGE
-VICTORY
-DEFEAT
-TURRET DESTROYED
-LORD
-TURTLE
-TEAM FIGHT
-
-Detection should initially focus on events that are visually obvious.
-
----
-
-9. OCR First
-
-Before training a custom computer-vision model, implement OCR.
-
-The system can periodically analyze frames:
-
-Video frame
-↓
-OCR
-↓
-Recognized text
-↓
-Event matching
-
-Example:
-
-OCR result:
-
-"SAVAGE"
-
-        ↓
-
-Detected event:
-SAVAGE
-
-        ↓
-
-Trigger replay buffer
-
-Use a confidence threshold to reduce false positives.
-
-Do not analyze every frame if unnecessary.
-
-Use an appropriate sampling rate to balance:
-
-- CPU usage
-- battery usage
-- detection accuracy
-
----
-
-10. ML / Computer Vision
-
-After OCR works, investigate a custom ML model.
-
-Potential approach:
-
-MLBB screenshots
-↓
-Label events
-↓
-Train object/event detector
-↓
-Evaluate model
-↓
-Export mobile-compatible model
-↓
-Run inference on Android
-
-Possible tools:
-
-- YOLO / Ultralytics
-- Roboflow for dataset labeling
-- TensorFlow Lite / LiteRT
-- ONNX Runtime if appropriate
-- OpenCV
-
-Do not assume a pre-trained MLBB-specific model exists.
-
-If no suitable model exists, plan for a custom dataset.
-
----
-
-11. Dataset
-
-The dataset should come from legally obtained gameplay recordings/screenshots that we are permitted to use.
-
-Possible labels:
-
-kill
-double_kill
-triple_kill
-maniac
-savage
-victory
-defeat
-lord
-turtle
-turret
-team_fight
-
-Start with a small number of high-value labels.
-
-Recommended initial model target:
-
-SAVAGE
-MANIAC
-DOUBLE KILL
-TRIPLE KILL
-VICTORY
-
-Do not spend time building a huge dataset before the replay-buffer MVP works.
-
----
-
-12. Performance Requirements
-
-The application is intended to run while the user is playing MLBB.
+# MLBB Highlight Editor
+
+## Product goal
+
+Build an Android app that turns one MLBB gameplay recording into a polished,
+editable highlight montage. Keep screen recording and ordinary manual editing,
+but make the main editing path:
+
+**Record or import → trim → Auto Highlight → choose a style → preview → export**
+
+Do not require users to place every cut or effect by hand. Auto-generated work
+must remain timeline data that users can edit before it is rendered.
+
+## Main workflow
+
+1. Record a match or import one video.
+2. Choose the source range in Trim.
+3. Run **Auto Highlight** and choose Cinematic, Aggressive, Clean, or Classic.
+4. Review OCR-recognized event moments; provide **Mark Moment** for events OCR
+   misses or cannot reliably recognize.
+5. Edit or remove generated clips, effects, speed, zoom, shake, and text.
+6. Optionally import a music file and set its mix level.
+7. Render and watch a full montage preview before exporting.
+
+Preserve the existing recording, video library, trim, manual-effects, playback,
+delete, and share workflows.
+
+## Automatic event detection
+
+- Analyze sampled frames from the selected trim range; do not decode every frame
+  without a demonstrated need.
+- OCR may create an event only when supported event text is actually visible and
+  passes a confidence threshold.
+- Never claim visual recognition of a kill, team fight, Lord/Turtle steal, or
+  other event unless a validated detector can identify it reliably.
+- When automatic recognition is unavailable or uncertain, let users mark a
+  moment while reviewing the source video.
+- Keep recognition language and limitations visible in the UI.
+- Expand event coverage or add an ML model only after evaluation on legally
+  obtained MLBB gameplay.
+
+## Generated timeline and editing
+
+Represent a generated montage as editable clips/events, not as a baked video.
+Keep source timestamps, clip ranges, event type and origin, style/effect preset,
+speed curve, text overlay, and audio cues in the edit model.
+
+For a readable event, start with roughly 1.5–3 seconds before it and 1–2 seconds
+after it. Merge nearby events into a meaningful sequence, avoid tiny cuts, and
+clamp all ranges to the user's selected trim. Users must be able to edit clip
+start/end, effect, effect intensity (Off/Low/Medium/High), speed, zoom, shake,
+text, and text position, or remove the clip.
+
+Use subtle, event-synchronized effects by default. Do not apply shake or slow
+motion across the entire recording. Keep game audio audible when optional music
+is mixed in.
+
+## Export
+
+- Concatenate selected source ranges into one MP4 using the existing Media3
+  Transformer pipeline.
+- Render a full preview from the same composition used for final export.
+- Support vertical 9:16 by default, landscape 16:9, and square 1:1, with 720p
+  and 1080p output sizes.
+- Keep aspect-ratio cropping centered and avoid stretching gameplay.
+- Save final exports in the user's selected folder; keep previews temporary.
+- Surface export, storage, and media-processing failures explicitly.
+
+Do not bundle music or sound effects without appropriate rights. Until a licensed
+asset library is available, allow user-provided music rather than displaying
+nonfunctional genre presets. Do not add controls for audio or export behavior
+that the pipeline does not actually implement.
+
+## Android architecture
+
+Prefer Kotlin, Jetpack Compose, MediaProjection, MediaCodec/MediaMuxer for
+recording, coroutines for background work, and AndroidX Media3 ExoPlayer and
+Transformer for editing and export. Capture belongs in a foreground service,
+independent of the editor UI. Use modern Android permissions and storage APIs;
+verify platform restrictions before changing recording behavior.
+
+Keep components reusable and separated by responsibility:
+
+- `recording/`: capture service, encoder, rolling-buffer components
+- `highlight/`: editable event/clip/timeline models, planner, composition export
+- `detection/`: OCR and future validated detectors
+- `ui/`: import, trim, Auto Highlight, timeline editing, preview, manual effects
+- `storage/`: source library, temporary render files, final output repository
+
+Reuse the existing player, timeline, trim system, effects, and export pipeline
+where practical. Keep automatic and manual editing interoperable without
+removing manual editing.
+
+## Performance and validation
+
+- Sample scaled frames off the main thread and release bitmaps/retrievers.
+- Bound scan work for long recordings and provide clear scanning/export state.
+- Avoid keeping full video files or decoded frame sequences in memory.
+- Validate the generated timeline planner and event boundaries with unit tests.
+- Validate preview/export composition and audio/video synchronization on Android
+  devices before claiming production reliability.
+- Document detector coverage and any unimplemented sound, music, or frame-rate
+  behavior accurately.

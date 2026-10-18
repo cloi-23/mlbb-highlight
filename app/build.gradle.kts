@@ -19,6 +19,7 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         compose = true
     }
 
@@ -32,6 +33,10 @@ kotlin {
     jvmToolchain(17)
 }
 
+tasks.withType<JavaCompile>().configureEach {
+    options.isFork = false
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.10.1")
@@ -39,6 +44,7 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.9.4")
     implementation("androidx.media3:media3-transformer:1.9.4")
     implementation("androidx.media3:media3-effect:1.9.4")
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))
     implementation("androidx.compose.ui:ui")

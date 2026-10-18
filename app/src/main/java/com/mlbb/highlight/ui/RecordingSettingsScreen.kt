@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Hd
 import androidx.compose.material.icons.outlined.Info
@@ -20,8 +21,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import kotlin.math.roundToInt
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -147,6 +151,51 @@ fun RecordingSettingsScreen(
             )
 
             androidx.compose.material3.HorizontalDivider(color = RecorderTheme.divider)
+            SettingHeading("Highlight effects", Icons.Outlined.AutoAwesome, RecorderTheme.cyan)
+            Text(
+                "Subtle effects applied only at confirmed kill timestamps. Original gameplay resolution, aspect ratio, duration, and audio are preserved.",
+                color = RecorderTheme.textSecondary,
+                style = MaterialTheme.typography.bodySmall
+            )
+            EffectToggleRow(
+                label = "Screen shake / vibration",
+                checked = settings.enableScreenShake,
+                onCheckedChange = { onSettingsChange(settings.copy(enableScreenShake = it)) }
+            )
+            EffectToggleRow(
+                label = "Slow motion around kill moment",
+                checked = settings.enableSlowMotion,
+                onCheckedChange = { onSettingsChange(settings.copy(enableSlowMotion = it)) }
+            )
+            EffectToggleRow(
+                label = "Brief impact flash",
+                checked = settings.enableImpactFlash,
+                onCheckedChange = { onSettingsChange(settings.copy(enableImpactFlash = it)) }
+            )
+            EffectToggleRow(
+                label = "Kill sound effect",
+                checked = settings.enableKillSound,
+                onCheckedChange = { onSettingsChange(settings.copy(enableKillSound = it)) }
+            )
+            EffectToggleRow(
+                label = "Background music",
+                checked = settings.enableBackgroundMusic,
+                onCheckedChange = { onSettingsChange(settings.copy(enableBackgroundMusic = it)) }
+            )
+            if (settings.enableBackgroundMusic) {
+                Text(
+                    "Music volume · ${(settings.musicVolume * 100f).roundToInt()}% (game audio kept)",
+                    color = RecorderTheme.textSecondary,
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Slider(
+                    value = settings.musicVolume,
+                    onValueChange = { onSettingsChange(settings.copy(musicVolume = it)) },
+                    valueRange = 0f..1f
+                )
+            }
+
+            androidx.compose.material3.HorizontalDivider(color = RecorderTheme.divider)
             IconSettingRow(
                 icon = Icons.Outlined.Info,
                 accent = RecorderTheme.green,
@@ -162,6 +211,25 @@ fun RecordingSettingsScreen(
             }
 
         }
+    }
+}
+
+@Composable
+private fun EffectToggleRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label, color = RecorderTheme.textPrimary, modifier = Modifier.weight(1f))
+        Switch(
+            checked = checked,
+            onCheckedChange = onCheckedChange
+        )
     }
 }
 

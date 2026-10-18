@@ -16,6 +16,7 @@ import androidx.media3.effect.MatrixTransformation
 import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.effect.TimestampWrapper
+import com.mlbb.highlight.highlight.TextPosition
 
 fun createSceneVideoEffects(
     options: VideoEffectOptions,
@@ -146,7 +147,7 @@ fun createSceneVideoEffects(
             )
         }
         if (preset == VideoEffectPreset.KILL_SLOWMO) {
-            add(zoom(1.035f, eventTimeUs, sceneStartUs, sceneEndUs))
+            add(zoom(options.zoomScale, eventTimeUs, sceneStartUs, sceneEndUs))
         }
     }
 }
@@ -176,7 +177,9 @@ private fun createTextImpactOverlay(
     text: String,
     opacity: Float,
     eventTimeUs: Long,
-    sceneEndUs: Long
+    sceneEndUs: Long,
+    displayDurationUs: Long = 450_000L,
+    position: TextPosition = TextPosition.CENTER
 ): GlEffect {
     val bitmap = Bitmap.createBitmap(640, 160, Bitmap.Config.ARGB_8888)
     Canvas(bitmap).apply {
@@ -190,18 +193,42 @@ private fun createTextImpactOverlay(
         }
         drawText(text, width / 2f, height * 0.68f, paint)
     }
-    val overlayEndUs = minOf(sceneEndUs, eventTimeUs + 450_000L)
+    val overlayEndUs = minOf(sceneEndUs, eventTimeUs + displayDurationUs)
     return OverlayEffect(
         listOf(object : BitmapOverlay() {
             override fun getBitmap(presentationTimeUs: Long): Bitmap = bitmap
 
             override fun getOverlaySettings(presentationTimeUs: Long): OverlaySettings {
                 val elapsedUs = presentationTimeUs - eventTimeUs
-                val fade = (1f - elapsedUs.toFloat() / 450_000f).coerceIn(0f, 1f)
+                val durationUs = displayDurationUs.coerceAtLeast(1L)
+                val fadeIn = (elapsedUs.toFloat() / 120_000f).coerceIn(0f, 1f)
+                val fadeOut = ((durationUs - elapsedUs).toFloat() / 220_000f).coerceIn(0f, 1f)
+                val fade = minOf(1f, fadeIn, fadeOut)
+                val anchorY = when (position) {
+                    TextPosition.TOP -> 0.8f
+                    TextPosition.CENTER -> 0f
+                    TextPosition.BOTTOM -> -0.8f
+                }
                 return StaticOverlaySettings.Builder()
                     .setAlphaScale(opacity.coerceIn(0f, 1f) * fade)
+                    .setOverlayFrameAnchor(0f, anchorY)
+                    .setBackgroundFrameAnchor(0f, anchorY)
                     .build()
             }
         })
     ).let { TimestampWrapper(it, eventTimeUs, overlayEndUs.coerceAtLeast(eventTimeUs + 1L)) }
 }
+
+fun createHighlightTextOverlay(
+    text: String,
+    startUs: Long,
+    endUs: Long,
+    position: TextPosition
+): GlEffect = createTextImpactOverlay(
+    text = text,
+    opacity = 0.95f,
+    eventTimeUs = startUs,
+    sceneEndUs = endUs,
+    displayDurationUs = (endUs - startUs).coerceAtLeast(1L),
+    position = position
+)

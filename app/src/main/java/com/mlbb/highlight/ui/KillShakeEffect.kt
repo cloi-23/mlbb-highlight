@@ -23,8 +23,9 @@ fun createKillShakeEffect(
         val timeSeconds = (presentationTimeUs - eventTimeUs).coerceAtLeast(0L) / 1_000_000f
         val decay = exp(-decayPerSecond * timeSeconds)
         val oscillation = sin(2.0 * PI * frequencyHz * timeSeconds).toFloat()
+        val dynamicZoom = 1.0f + (0.015f + 0.025f * intensity.coerceIn(0f, 1f)) * decay
         Matrix().apply {
-            setScale(zoom, zoom, 0.5f, 0.5f)
+            setScale(dynamicZoom, dynamicZoom, 0.5f, 0.5f)
             postTranslate(
                 amplitude * oscillation * decay,
                 amplitude * 0.65f * sin(2.0 * PI * (frequencyHz * 0.82f) * timeSeconds).toFloat() * decay

@@ -54,6 +54,11 @@ class HighlightRepository(private val context: Context) {
         return File(getRecordingsDirectory(), "edited_$timestamp.mp4")
     }
 
+    fun createPreviewOutputFile(): File {
+        val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US).format(Date())
+        return File(context.cacheDir, "highlight_preview_$timestamp.mp4")
+    }
+
     fun copyToFolderTree(file: File, folderTreeUri: Uri): Uri {
         val destination = createVideoDocument(folderTreeUri, file.name)
         try {

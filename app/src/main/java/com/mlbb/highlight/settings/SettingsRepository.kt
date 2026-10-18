@@ -26,7 +26,13 @@ class SettingsRepository(context: Context) {
             frameRate = prefs.getInt(KEY_FRAME_RATE, DEFAULT_FRAME_RATE)
                 .let { if (it == HIGH_FRAME_RATE) HIGH_FRAME_RATE else DEFAULT_FRAME_RATE },
             audioSource = audioSource,
-            saveLocationUri = prefs.getString(KEY_SAVE_LOCATION_URI, null)
+            saveLocationUri = prefs.getString(KEY_SAVE_LOCATION_URI, null),
+            enableScreenShake = prefs.getBoolean(KEY_ENABLE_SCREEN_SHAKE, true),
+            enableSlowMotion = prefs.getBoolean(KEY_ENABLE_SLOW_MOTION, true),
+            enableImpactFlash = prefs.getBoolean(KEY_ENABLE_IMPACT_FLASH, true),
+            enableKillSound = prefs.getBoolean(KEY_ENABLE_KILL_SOUND, false),
+            enableBackgroundMusic = prefs.getBoolean(KEY_ENABLE_BACKGROUND_MUSIC, false),
+            musicVolume = prefs.getFloat(KEY_MUSIC_VOLUME, 0.13f)
         )
     }
 
@@ -36,6 +42,12 @@ class SettingsRepository(context: Context) {
             putInt(KEY_FRAME_RATE, settings.frameRate)
             putString(KEY_AUDIO_SOURCE, settings.audioSource.name)
             putString(KEY_SAVE_LOCATION_URI, settings.saveLocationUri)
+            putBoolean(KEY_ENABLE_SCREEN_SHAKE, settings.enableScreenShake)
+            putBoolean(KEY_ENABLE_SLOW_MOTION, settings.enableSlowMotion)
+            putBoolean(KEY_ENABLE_IMPACT_FLASH, settings.enableImpactFlash)
+            putBoolean(KEY_ENABLE_KILL_SOUND, settings.enableKillSound)
+            putBoolean(KEY_ENABLE_BACKGROUND_MUSIC, settings.enableBackgroundMusic)
+            putFloat(KEY_MUSIC_VOLUME, settings.musicVolume)
         }
     }
 
@@ -52,5 +64,11 @@ class SettingsRepository(context: Context) {
         private const val KEY_AUDIO_SOURCE = "audio_source"
         private const val KEY_INCLUDE_AUDIO = "include_audio"
         private const val KEY_SAVE_LOCATION_URI = "save_location_uri"
+        private const val KEY_ENABLE_SCREEN_SHAKE = "enable_screen_shake"
+        private const val KEY_ENABLE_SLOW_MOTION = "enable_slow_motion"
+        private const val KEY_ENABLE_IMPACT_FLASH = "enable_impact_flash"
+        private const val KEY_ENABLE_KILL_SOUND = "enable_kill_sound"
+        private const val KEY_ENABLE_BACKGROUND_MUSIC = "enable_background_music"
+        private const val KEY_MUSIC_VOLUME = "music_volume"
     }
 }
