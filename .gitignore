@@ -11,7 +11,7 @@ local.properties
 *.iml
 .externalNativeBuild/
 .cxx/
-
+samples/
 # Android Studio generated files
 captures/
 .externalNativeBuild/

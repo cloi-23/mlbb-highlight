@@ -80,6 +80,7 @@ import com.mlbb.highlight.highlight.HighlightAspectRatio
 import com.mlbb.highlight.highlight.HighlightEvent
 import com.mlbb.highlight.highlight.HighlightEventOrigin
 import com.mlbb.highlight.highlight.HighlightEventType
+import com.mlbb.highlight.highlight.EffectPreset
 import com.mlbb.highlight.highlight.HighlightResolution
 import com.mlbb.highlight.highlight.HighlightStyle
 import com.mlbb.highlight.highlight.HighlightTimeline
@@ -189,6 +190,9 @@ class MainActivity : ComponentActivity() {
                     var highlightEvents by remember { mutableStateOf(emptyList<HighlightEvent>()) }
                     var highlightScanResult by remember {
                         mutableStateOf<AutoHighlightEngine.HighlightScanResult?>(null)
+                    }
+                    var highlightScanProgress by remember {
+                        mutableStateOf<AutoHighlightEngine.KdaScanProgress?>(null)
                     }
                     var highlightTimeline by remember { mutableStateOf<HighlightTimeline?>(null) }
                     var highlightStyle by rememberSaveable { mutableStateOf(HighlightStyle.CINEMATIC) }
@@ -332,7 +336,9 @@ class MainActivity : ComponentActivity() {
                         highlightStyle = style
                         isAnalyzingHighlights = true
                         highlightScanResult = null
+                        highlightScanProgress = null
                         highlightEvents = emptyList()
+                        highlightTimeline = null
                         highlightAnalysisMessage =
                             "Analyzing the calibrated K/D/A region and kill-feed context…"
                         screenScope.launch {
@@ -342,7 +348,8 @@ class MainActivity : ComponentActivity() {
                                     sourceUri = source,
                                     trimStartMs = effectiveStartMs,
                                     trimEndMs = effectiveEndMs,
-                                    hudRegion = hudRegion
+                                    hudRegion = hudRegion,
+                                    onProgress = { progress -> highlightScanProgress = progress }
                                 )
                                 highlightScanResult = scanResult
                                 val events = scanResult.events
@@ -372,8 +379,15 @@ class MainActivity : ComponentActivity() {
                                 highlightAnalysisMessage = when {
                                     events.isNotEmpty() ->
                                         "$kdaMessage Found ${events.size} moment(s) only after my kill count increased."
+                                    scanResult.reviewDetections.isNotEmpty() -> {
+                                        val uncertain = scanResult.reviewDetections
+                                        val example = uncertain.first()
+                                        "$kdaMessage Detected ${uncertain.size} kill-count increase(s) that need review " +
+                                            "(for example ${example.previousKills} → ${example.currentKills}); " +
+                                            "uncertain jumps were not turned into automatic moments. Review them below."
+                                    }
                                     baseline == null ->
-                                        "Could not confidently read all three K/D/A values in the upper-right HUD. " +
+                                        "Could not confidently read all three K/D/A values in the calibrated HUD region. " +
                                             "Shop gold and kill-feed banners are ignored; mark moments manually."
                                     else ->
                                         "$kdaMessage My kill count never increased. " +
@@ -440,7 +454,7 @@ class MainActivity : ComponentActivity() {
                             return
                         }
                         val composition = try {
-                            val comp = buildHighlightComposition(timeline, settings)
+                            val comp = buildHighlightComposition(timeline, settings, applicationContext)
                             val validation = com.mlbb.highlight.highlight.validateHighlightComposition(timeline, comp, settings)
                             if (!validation.isValid) {
                                 exportMessage = "Preview validation: ${validation.issues.joinToString()}"
@@ -567,7 +581,7 @@ class MainActivity : ComponentActivity() {
                                 val timelineToExport = currentTimeline ?: throw IllegalArgumentException(
                                     "Generate or mark at least one highlight moment first"
                                 )
-                                val comp = buildHighlightComposition(timelineToExport, settings)
+                                val comp = buildHighlightComposition(timelineToExport, settings, applicationContext)
                                 val validation = com.mlbb.highlight.highlight.validateHighlightComposition(timelineToExport, comp, settings)
                                 if (!validation.isValid) {
                                     exportMessage = "Validation issue: ${validation.issues.joinToString()}"
@@ -1058,10 +1072,28 @@ class MainActivity : ComponentActivity() {
                                                 selectedDestination = RecorderDestination.HOME.name
                                             },
                                             onNext = {
+                                                val selectedStart = trimStartMs.coerceAtLeast(0L)
+                                                val selectedEnd = trimEndMs.coerceAtLeast(selectedStart)
+                                                videoEditState = videoEditState.copy(
+                                                    trimStartMs = selectedStart,
+                                                    trimEndMs = selectedEnd
+                                                )
+                                                effectStartMs = 0L
+                                                effectEndMs = selectedEnd - selectedStart
+                                                playheadMs = selectedStart
                                                 selectedDestination = RecorderDestination.EFFECTS.name
                                             },
                                             onAutoHighlight = {
-                                                highlightAnalysisMessage = null
+                                                val selectedStart = trimStartMs.coerceAtLeast(0L)
+                                                val selectedEnd = trimEndMs.coerceAtLeast(selectedStart)
+                                                videoEditState = videoEditState.copy(
+                                                    trimStartMs = selectedStart,
+                                                    trimEndMs = selectedEnd
+                                                )
+                                                highlightAnalysisMessage =
+                                                    "Selected trim ${com.mlbb.highlight.ui.formatEditorTime(selectedStart)}–" +
+                                                        "${com.mlbb.highlight.ui.formatEditorTime(selectedEnd)}. " +
+                                                        "Auto Highlight will analyze only this range."
                                                 selectedDestination = RecorderDestination.AUTO_HIGHLIGHT.name
                                             }
                                         )
@@ -1070,9 +1102,28 @@ class MainActivity : ComponentActivity() {
                                             videoUri = selectedVideoUri,
                                             trimStartMs = trimStartMs,
                                             trimEndMs = trimEndMs,
+                                            sourceDurationMs = sourceDurationMs,
+                                            onTrimChanged = { start, end ->
+                                                val safeStart = start.coerceAtLeast(0L)
+                                                val safeEnd = end.coerceAtLeast(safeStart)
+                                                videoEditState = videoEditState.copy(
+                                                    trimStartMs = safeStart,
+                                                    trimEndMs = safeEnd,
+                                                    sceneEffects = emptyList()
+                                                )
+                                                effectStartMs = 0L
+                                                effectEndMs = safeEnd - safeStart
+                                                selectedSceneId = ""
+                                                isEffectPreviewApplied = false
+                                                highlightEvents = emptyList()
+                                                highlightScanResult = null
+                                                highlightTimeline = null
+                                                highlightAnalysisMessage = null
+                                            },
                                             timeline = highlightTimeline,
                                             detectedEvents = highlightEvents,
                                             scanResult = highlightScanResult,
+                                            scanProgress = highlightScanProgress,
                                             hudRegion = hudRegion,
                                             isAnalyzing = isAnalyzingHighlights,
                                             analysisMessage = highlightAnalysisMessage,
@@ -1144,6 +1195,16 @@ class MainActivity : ComponentActivity() {
                                                 }
                                                 isEffectPreviewApplied = false
                                             },
+                                            onApplyEffectToAll = { preset ->
+                                                highlightTimeline = highlightTimeline?.let { timeline ->
+                                                    timeline.copy(
+                                                        clips = timeline.clips.map { clip ->
+                                                            clip.copy(effectPreset = preset)
+                                                        }
+                                                    )
+                                                }
+                                                isEffectPreviewApplied = false
+                                            },
                                             onClipRemoved = { removed ->
                                                 highlightTimeline = highlightTimeline?.let { timeline ->
                                                     timeline.copy(
@@ -1180,6 +1241,16 @@ class MainActivity : ComponentActivity() {
                                             onMusicVolumeChanged = { volume ->
                                                 highlightTimeline = highlightTimeline?.copy(
                                                     musicVolume = volume.coerceIn(0f, 1f)
+                                                )
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onKillSoundEnabledChanged = { enabled ->
+                                                highlightTimeline = highlightTimeline?.copy(enableKillSound = enabled)
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onKillSoundVolumeChanged = { volume ->
+                                                highlightTimeline = highlightTimeline?.copy(
+                                                    killSoundVolume = volume.coerceIn(0f, 1f)
                                                 )
                                                 isEffectPreviewApplied = false
                                             },

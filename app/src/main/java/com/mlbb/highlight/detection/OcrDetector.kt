@@ -6,10 +6,8 @@ import com.google.android.gms.tasks.Task
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import com.mlbb.highlight.highlight.HighlightEventType
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.Closeable
-import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -23,110 +21,209 @@ class OcrDetector(
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
 
     override suspend fun analyze(frame: Bitmap, presentationTimeMs: Long): DetectionResult {
-        val fullFrameText = recognizer.process(InputImage.fromBitmap(frame, 0)).await()
-        val kdaCrop = cropKdaHud(frame) ?: return DetectionResult(
-            eventType = classifyBanner(fullFrameText),
-            confidence = 0f,
-            textObservations = textObservations(fullFrameText)
-        )
-        val enlargedKdaCrop = Bitmap.createScaledBitmap(
-            kdaCrop.bitmap,
-            kdaCrop.bitmap.width * KDA_CROP_SCALE,
-            kdaCrop.bitmap.height * KDA_CROP_SCALE,
-            true
-        )
-        val kdaText = try {
-            recognizer.process(InputImage.fromBitmap(enlargedKdaCrop, 0)).await()
-        } finally {
-            enlargedKdaCrop.recycle()
-            kdaCrop.bitmap.recycle()
+        val autoRegion = automaticHudRegion(frame)
+        val regions = buildList {
+            add("calibrated" to hudRegion)
+            if (autoRegion != hudRegion) add("viewport-top-right" to autoRegion)
         }
-        val focusedHudTokens = extractNumberTokens(kdaText) { bounds ->
-            mapCropBoundsToFrame(bounds, kdaCrop)
-        }
-        var parseResult = KdaSpatialParser.parseDetailed(
-            tokens = focusedHudTokens,
-            frameWidth = frame.width,
-            frameHeight = frame.height
-        )
-        if (parseResult.readings.isEmpty()) {
-            val upperHudTokens = extractNumberTokens(fullFrameText) { Rect(it) }
-                .filter { token ->
-                    token.boxTop < frame.height * 0.30f &&
-                        token.boxLeft > frame.width * 0.50f
-                }
-            if (upperHudTokens.isNotEmpty()) {
-                val fallbackResult = KdaSpatialParser.parseDetailed(
-                    tokens = upperHudTokens,
-                    frameWidth = frame.width,
-                    frameHeight = frame.height
-                )
-                if (fallbackResult.readings.isNotEmpty()) {
-                    parseResult = fallbackResult
+        val candidates = mutableListOf<Pair<String, KdaReading>>()
+        val parsedCandidates = mutableListOf<KdaReading>()
+        val observations = mutableListOf<OcrTextObservation>()
+        val rejections = mutableListOf<String>()
+        val rawTexts = mutableListOf<String>()
+
+        for ((label, region) in regions) {
+            val bounds = region.toPixelRect(frame.width, frame.height)
+            if (bounds == null || bounds.isEmpty) {
+                rejections += "$label ROI invalid for ${frame.width}x${frame.height} frame"
+                continue
+            }
+            val crop = Bitmap.createBitmap(frame, bounds.left, bounds.top, bounds.width(), bounds.height())
+            val enlarged = Bitmap.createScaledBitmap(
+                crop,
+                crop.width * KDA_CROP_SCALE,
+                crop.height * KDA_CROP_SCALE,
+                true
+            )
+            val cropInfo = KdaCrop(crop, bounds.left, bounds.top, KDA_CROP_SCALE.toFloat())
+            val text = try {
+                recognizer.process(InputImage.fromBitmap(enlarged, 0)).await()
+            } finally {
+                enlarged.recycle()
+                crop.recycle()
+            }
+            val lines = text.textBlocks.flatMap { block -> block.lines }.map { it.text }
+            rawTexts += "$label crop=${bounds.toShortString()} text=${lines.joinToString(" | ")}"
+            observations += textObservations(text) { mapCropBoundsToFrame(it, cropInfo) }
+            val tokens = extractNumberTokens(text) { mapCropBoundsToFrame(it, cropInfo) }
+            val parsed = KdaSpatialParser.parseDetailed(tokens, frame.width, frame.height)
+            parsedCandidates += parsed.readings
+            val accepted = parsed.readings.filter { reading ->
+                val insideCrop = bounds.contains(reading.bounds)
+                val compactRow = reading.bounds.width() <= bounds.width() * MAX_ROW_WIDTH_OF_ROI &&
+                    reading.bounds.height() <= bounds.height() * MAX_ROW_HEIGHT_OF_ROI
+                if (!reading.isTripletNumericallyValid) {
+                    rejections += "$label '${reading.rawText}' rejected: K/D/A has a non-numeric or implausible component"
+                    false
+                } else if (!insideCrop || !compactRow) {
+                    rejections += "$label '${reading.rawText}' rejected: candidate geometry is outside the compact HUD row"
+                    false
+                } else {
+                    true
                 }
             }
+            candidates += accepted.map { label to it }
+            if (parsed.readings.isEmpty()) {
+                rejections += parsed.rejectedReasons.map { "$label: $it" }
+                rejections += "$label OCR text did not form a numerical K/D/A triplet"
+            }
         }
-        val lines = fullFrameText.textBlocks.flatMap { it.lines }
-        val candidates = lines.mapNotNull { line ->
-            val eventType = classifyBanner(line.text) ?: return@mapNotNull null
-            val confidence = (line.confidence ?: 0.5f).coerceIn(0f, 1f)
-            if (confidence < MIN_LINE_CONFIDENCE) return@mapNotNull null
-            DetectionResult(eventType, confidence, line.text)
+
+        fun uniqueReadings(rows: List<KdaReading>): List<KdaReading> = rows.distinctBy { reading ->
+            listOf(
+                reading.kills,
+                reading.deaths,
+                reading.assists,
+                reading.bounds.centerX() / DUPLICATE_POSITION_BUCKET_PX,
+                reading.bounds.centerY() / DUPLICATE_POSITION_BUCKET_PX
+            )
         }
-        val banner = candidates.maxByOrNull(DetectionResult::confidence)
+        val calibratedCandidates = uniqueReadings(candidates.filter { it.first == "calibrated" }.map { it.second })
+        val automaticCandidates = uniqueReadings(candidates.filter { it.first != "calibrated" }.map { it.second })
+        val selectedCandidates = when {
+            // The automatic ROI follows the active gameplay viewport. Prefer it
+            // when an old manual calibration happens to contain unrelated values.
+            automaticCandidates.size == 1 && calibratedCandidates.size == 1 &&
+                !sameKda(automaticCandidates.single(), calibratedCandidates.single()) -> {
+                rejections += "Calibrated ROI disagrees with viewport HUD; using viewport-validated K/D/A"
+                automaticCandidates
+            }
+            automaticCandidates.size == 1 -> automaticCandidates
+            calibratedCandidates.size == 1 && automaticCandidates.isEmpty() -> calibratedCandidates
+            calibratedCandidates.size == 1 && automaticCandidates.size > 1 -> calibratedCandidates
+            automaticCandidates.size == 1 && calibratedCandidates.size > 1 -> automaticCandidates
+            calibratedCandidates.isNotEmpty() || automaticCandidates.isNotEmpty() -> {
+                rejections += "Multiple numerical rows in the HUD ROI; waiting instead of guessing"
+                emptyList()
+            }
+            else -> emptyList()
+        }
+        if (selectedCandidates.isEmpty() && rejections.isEmpty()) {
+            rejections += "No numerical K/D/A row found in calibrated or viewport top-right HUD ROI"
+        }
         return DetectionResult(
-            eventType = banner?.eventType,
-            confidence = banner?.confidence ?: 0f,
-            recognizedText = banner?.recognizedText,
-            kdaCandidates = parseResult.readings,
-            textObservations = textObservations(fullFrameText) +
-                textObservations(kdaText) { bounds -> mapCropBoundsToFrame(bounds, kdaCrop) },
-            rejectedDetections = parseResult.rejectedReasons
+            confidence = selectedCandidates.maxOfOrNull(KdaReading::confidence) ?: 0f,
+            kdaCandidates = selectedCandidates,
+            textObservations = observations,
+            rejectedDetections = rejections.distinct(),
+            rawOcrText = rawTexts.joinToString("; "),
+            parsedKdaCandidates = parsedCandidates.distinctBy { reading ->
+                listOf(reading.kills, reading.deaths, reading.assists, reading.bounds.toShortString())
+            }
         )
     }
+
+    private fun sameKda(first: KdaReading, second: KdaReading): Boolean =
+        first.kills == second.kills && first.deaths == second.deaths && first.assists == second.assists
 
     override fun close() {
         recognizer.close()
     }
 
-    private fun classifyBanner(text: String): HighlightEventType? {
-        val normalized = text.uppercase(Locale.ROOT)
-            .replace(Regex("[^A-Z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        return when {
-            containsPhrase(normalized, "SAVAGE") -> HighlightEventType.SAVAGE
-            containsPhrase(normalized, "MANIAC") -> HighlightEventType.MANIAC
-            containsPhrase(normalized, "TRIPLE KILL") -> HighlightEventType.TRIPLE_KILL
-            containsPhrase(normalized, "DOUBLE KILL") -> HighlightEventType.DOUBLE_KILL
-            containsPhrase(normalized, "FIRST BLOOD") -> HighlightEventType.FIRST_BLOOD
-            containsPhrase(normalized, "VICTORY") -> HighlightEventType.VICTORY
-            containsPhrase(normalized, "DEFEAT") -> HighlightEventType.DEFEAT
-            containsPhrase(normalized, "YOU HAVE SLAIN") ||
-                containsPhrase(normalized, "AN ENEMY HAS BEEN SLAIN") ||
-                containsPhrase(normalized, "HAS SLAIN") ||
-                containsPhrase(normalized, "KILLING SPREE") ||
-                containsPhrase(normalized, "MEGA KILL") ||
-                containsPhrase(normalized, "UNSTOPPABLE") ||
-                containsPhrase(normalized, "MONSTER KILL") ||
-                containsPhrase(normalized, "GODLIKE") ||
-                containsPhrase(normalized, "LEGENDARY") ||
-                containsPhrase(normalized, "WIPEOUT") -> HighlightEventType.KILL
-            else -> null
-        }
-    }
-
-    private fun cropKdaHud(frame: Bitmap): KdaCrop? {
-        val bounds = hudRegion.toPixelRect(frame.width, frame.height) ?: return null
-        return KdaCrop(
-            bitmap = Bitmap.createBitmap(frame, bounds.left, bounds.top, bounds.width(), bounds.height()),
-            left = bounds.left,
-            top = bounds.top
+    /** Find the gameplay viewport, then scan only its top-right K/D/A counter area. */
+    private fun automaticHudRegion(frame: Bitmap): HudRegion {
+        val viewport = activeViewportBounds(frame)
+        val viewportWidth = viewport.width().coerceAtLeast(1)
+        val viewportHeight = viewport.height().coerceAtLeast(1)
+        val roiLeft = viewport.left + (viewportWidth * AUTO_ROI_LEFT_FRACTION).toInt()
+        val roiRight = viewport.left + (viewportWidth * AUTO_ROI_RIGHT_FRACTION).toInt()
+        val roiTopPx = viewport.top
+        val roiBottomPx = (viewport.top + (viewportHeight * AUTO_ROI_HEIGHT_FRACTION).toInt())
+            .coerceAtMost(viewport.bottom)
+        return HudRegion(
+            left = (roiLeft.toFloat() / frame.width).coerceIn(0f, 1f - HudRegion.MIN_REGION_SIZE),
+            top = (roiTopPx.toFloat() / frame.height).coerceIn(0f, 1f - HudRegion.MIN_REGION_SIZE),
+            right = (roiRight.toFloat() / frame.width).coerceIn(
+                (roiLeft.toFloat() / frame.width) + HudRegion.MIN_REGION_SIZE,
+                1f
+            ),
+            bottom = (roiBottomPx.toFloat() / frame.height).coerceIn(
+                (roiTopPx.toFloat() / frame.height) + HudRegion.MIN_REGION_SIZE,
+                1f
+            )
         )
     }
 
+    /** Exclude black letterboxing so ROI coordinates follow the actual gameplay viewport. */
+    private fun activeViewportBounds(frame: Bitmap): Rect {
+        val sampleStepX = (frame.width / 64).coerceAtLeast(1)
+        val sampleStepY = (frame.height / 64).coerceAtLeast(1)
+        val rowStep = (frame.height / 240).coerceAtLeast(1)
+        val colStep = (frame.width / 240).coerceAtLeast(1)
+        val litRows = mutableListOf<Int>()
+        var y = 0
+        while (y < frame.height) {
+            var lit = 0
+            var sampled = 0
+            var x = 0
+            while (x < frame.width) {
+                val color = frame.getPixel(x, y)
+                val brightness = maxOf(
+                    android.graphics.Color.red(color),
+                    android.graphics.Color.green(color),
+                    android.graphics.Color.blue(color)
+                )
+                if (brightness > BLACK_BAR_BRIGHTNESS) lit += 1
+                sampled += 1
+                x += sampleStepX
+            }
+            if (sampled > 0 && lit.toFloat() / sampled >= MIN_LIT_ROW_FRACTION) {
+                litRows += y
+            }
+            y += rowStep
+        }
+        val litColumns = mutableListOf<Int>()
+        var x = 0
+        while (x < frame.width) {
+            var lit = 0
+            var sampled = 0
+            var sampleY = 0
+            while (sampleY < frame.height) {
+                val color = frame.getPixel(x, sampleY)
+                val brightness = maxOf(
+                    android.graphics.Color.red(color),
+                    android.graphics.Color.green(color),
+                    android.graphics.Color.blue(color)
+                )
+                if (brightness > BLACK_BAR_BRIGHTNESS) lit += 1
+                sampled += 1
+                sampleY += sampleStepY
+            }
+            if (sampled > 0 && lit.toFloat() / sampled >= MIN_LIT_ROW_FRACTION) {
+                litColumns += x
+            }
+            x += colStep
+        }
+        val activeVerticalSpan = inferActiveSpanBounds(
+            samples = litRows,
+            dimension = frame.height,
+            sampleStep = rowStep,
+            minimumFraction = MIN_ACTIVE_VIEWPORT_HEIGHT_FRACTION,
+            minimumSamples = MIN_ACTIVE_ROW_SAMPLES
+        )
+        val top = activeVerticalSpan?.first ?: 0
+        val bottom = activeVerticalSpan?.second ?: frame.height
+        val left = if (litColumns.size >= MIN_ACTIVE_ROW_SAMPLES &&
+            litColumns.last() - litColumns.first() >= frame.width * MIN_ACTIVE_VIEWPORT_FRACTION
+        ) (litColumns.first() - colStep).coerceAtLeast(0) else 0
+        val right = if (left == 0 && (litColumns.size < MIN_ACTIVE_ROW_SAMPLES ||
+                litColumns.last() - litColumns.first() < frame.width * MIN_ACTIVE_VIEWPORT_FRACTION)
+        ) frame.width else (litColumns.last() + colStep + 1).coerceAtMost(frame.width)
+        return Rect(left, top, right, bottom)
+    }
+
     private fun mapCropBoundsToFrame(bounds: Rect, crop: KdaCrop): Rect {
-        val scale = KDA_CROP_SCALE.toFloat()
+        val scale = crop.scale
         return Rect(
             crop.left + (bounds.left / scale).toInt(),
             crop.top + (bounds.top / scale).toInt(),
@@ -157,7 +254,20 @@ class OcrDetector(
                     )
                 }.orEmpty()
             } else {
-                elements.mapNotNull { element ->
+                val lineToken = line.boundingBox?.let { raw ->
+                    val mapped = mapBounds(raw)
+                    KdaNumberToken(
+                        text = line.text,
+                        bounds = mapped,
+                        confidence = line.confidence ?: elements.mapNotNull { it.confidence }
+                            .average().toFloat().takeIf { it.isFinite() } ?: 0.6f,
+                        boxLeft = mapped.left,
+                        boxTop = mapped.top,
+                        boxRight = mapped.right,
+                        boxBottom = mapped.bottom
+                    )
+                }
+                listOfNotNull(lineToken) + elements.mapNotNull { element ->
                     val raw = element.boundingBox ?: return@mapNotNull null
                     val mapped = mapBounds(raw)
                     KdaNumberToken(
@@ -172,17 +282,6 @@ class OcrDetector(
                 }
             }
         }
-
-    private fun classifyBanner(text: com.google.mlkit.vision.text.Text): HighlightEventType? =
-        text.textBlocks.asSequence()
-            .flatMap { it.lines.asSequence() }
-            .mapNotNull { line ->
-                val type = classifyBanner(line.text) ?: return@mapNotNull null
-                if ((line.confidence ?: 0f) < MIN_LINE_CONFIDENCE) return@mapNotNull null
-                type to (line.confidence ?: 0f)
-            }
-            .maxByOrNull { it.second }
-            ?.first
 
     private fun textObservations(
         text: com.google.mlkit.vision.text.Text,
@@ -199,9 +298,6 @@ class OcrDetector(
             }
         }
 
-    private fun containsPhrase(text: String, phrase: String): Boolean =
-        Regex("(^| )${Regex.escape(phrase)}( |$)").containsMatchIn(text)
-
     private suspend fun <T> Task<T>.await(): T =
         suspendCancellableCoroutine { continuation ->
             addOnSuccessListener { value ->
@@ -216,25 +312,51 @@ class OcrDetector(
         }
 
     private companion object {
-        const val MIN_LINE_CONFIDENCE = 0.65f
         const val KDA_CROP_SCALE = 4
+        const val AUTO_ROI_LEFT_FRACTION = 0.77f
+        const val AUTO_ROI_RIGHT_FRACTION = 0.94f
+        const val AUTO_ROI_HEIGHT_FRACTION = 0.16f
+        const val MAX_ROW_WIDTH_OF_ROI = 0.98f
+        const val MAX_ROW_HEIGHT_OF_ROI = 0.80f
+        const val DUPLICATE_POSITION_BUCKET_PX = 8
+        const val BLACK_BAR_BRIGHTNESS = 22
+        const val MIN_LIT_ROW_FRACTION = 0.08f
+        const val MIN_ACTIVE_ROW_SAMPLES = 16
+        const val MIN_ACTIVE_VIEWPORT_FRACTION = 0.35f
+        const val MIN_ACTIVE_VIEWPORT_HEIGHT_FRACTION = 0.10f
     }
 
     private data class KdaCrop(
         val bitmap: Bitmap,
         val left: Int,
-        val top: Int
+        val top: Int,
+        val scale: Float
     )
 }
 
+internal fun inferActiveSpanBounds(
+    samples: List<Int>,
+    dimension: Int,
+    sampleStep: Int,
+    minimumFraction: Float,
+    minimumSamples: Int
+): Pair<Int, Int>? {
+    if (samples.size < minimumSamples || dimension <= 0 || samples.isEmpty() ||
+        samples.last() - samples.first() < dimension * minimumFraction
+    ) return null
+    return (samples.first() - sampleStep).coerceAtLeast(0) to
+        (samples.last() + sampleStep + 1).coerceAtMost(dimension)
+}
+
 data class DetectionResult(
-    val eventType: HighlightEventType?,
     val confidence: Float,
-    val recognizedText: String? = null,
     val kdaCandidates: List<KdaReading> = emptyList(),
     val textObservations: List<OcrTextObservation> = emptyList(),
     val rejectedDetections: List<String> = emptyList(),
-    val visualCues: List<HudVisualCue> = emptyList()
+    val visualCues: List<HudVisualCue> = emptyList(),
+    val rawOcrText: String = "",
+    /** All parser outputs, including candidates later rejected by ROI arbitration. */
+    val parsedKdaCandidates: List<KdaReading> = kdaCandidates
 )
 
 data class HudVisualCue(
@@ -304,7 +426,8 @@ data class KdaReading(
     val boxBottom: Int = bounds.bottom,
     val rawText: String = "",
     val firstChar: String = "",
-    val isFirstDigitValid: Boolean = true
+    val isFirstDigitValid: Boolean = true,
+    val isTripletNumericallyValid: Boolean = true
 )
 
 data class KdaNumberToken(
@@ -331,15 +454,16 @@ object KdaSpatialParser {
     private const val MIN_CONFIDENCE = 0.45f
     private const val SAME_ROW_HEIGHT_FRACTION = 0.035f
     private const val MAX_NUMBER_GAP_FRACTION = 0.12f
-    private const val MAX_PLAUSIBLE_KILLS = 30
+    private const val MAX_NUMBER_GAP_TOKEN_HEIGHTS = 2.5f
+    private const val MAX_KDA_COMPONENT = 99
 
     fun normalizeFirstDigit(text: String): Int? {
-        val trimmed = text.trim()
+        val trimmed = text.trim().replace(Regex("(?i)^x(?=[0-9])"), "")
         if (trimmed.isEmpty()) return null
-        // Keep valid double digit game totals, but reject implausible merged
-        // OCR values such as 48 from a misread K/D/A row.
+        // The HUD ROI and three-number row geometry provide context; retain
+        // legitimate two-digit counter values instead of applying a low cap.
         if (trimmed.all { it in '0'..'9' }) {
-            return trimmed.toIntOrNull()?.takeIf { it <= MAX_PLAUSIBLE_KILLS }
+            return trimmed.toIntOrNull()?.takeIf { it <= MAX_KDA_COMPONENT }
         }
         return null
     }
@@ -367,27 +491,39 @@ object KdaSpatialParser {
             .filter { it.confidence >= MIN_CONFIDENCE && !isBoxEmpty(it) }
             .map { it.copy(text = normalizeOcrText(it.text)) }
         val directTriplets = validTokens.mapNotNull { token ->
-            val match = tripletPattern.find(token.text)
-                ?: spaceSeparatedTripletPattern.find(token.text)
-                ?: compactTripletPattern.find(token.text)
-                ?: return@mapNotNull null
+            val iconStrippedText = token.text
+                .replace(Regex("(?i)^\\s*x(?=\\s*[0-9])"), "")
+            val compactInput = iconStrippedText
+                .filterNot(Char::isWhitespace)
+            val exactMatch = sequenceOf(
+                iconStrippedText to tripletPattern.find(iconStrippedText),
+                iconStrippedText to spaceSeparatedTripletPattern.find(iconStrippedText),
+                token.text to tripletPattern.find(token.text),
+                token.text to spaceSeparatedTripletPattern.find(token.text),
+                compactInput to compactTripletPattern.find(compactInput)
+            ).firstOrNull { (source, candidate) ->
+                candidate != null && source.substring(0, candidate.range.first).isBlank() &&
+                    source.substring(candidate.range.last + 1).isBlank()
+            } ?: return@mapNotNull null
+            val match = exactMatch.second ?: return@mapNotNull null
             val rawPart1 = match.groupValues[1]
             val rawPart2 = match.groupValues[2]
             val rawPart3 = match.groupValues[3]
             val killsDigit = normalizeFirstDigit(rawPart1)
-            val deaths = rawPart2.toIntOrNull() ?: 0
-            val assists = rawPart3.toIntOrNull() ?: 0
+            val deaths = rawPart2.toIntOrNull()
+            val assists = rawPart3.toIntOrNull()
             val firstChar = rawPart1.trim()
             val rawText = token.text
             createReading(
                 kills = killsDigit ?: -1,
-                deaths = deaths,
-                assists = assists,
+                deaths = deaths ?: -1,
+                assists = assists ?: -1,
                 tokens = listOf(token),
                 confidence = token.confidence,
                 rawText = rawText,
                 firstChar = firstChar,
-                isFirstDigitValid = killsDigit != null
+                isFirstDigitValid = killsDigit != null,
+                isTripletNumericallyValid = killsDigit != null && deaths != null && assists != null
             )
         }
         val spatialTriplets = validTokens.mapNotNull { token ->
@@ -397,17 +533,18 @@ object KdaSpatialParser {
             }
             val rawPart1 = values[0].value
             val killsDigit = normalizeFirstDigit(rawPart1)
-            val deaths = values[1].value.toIntOrNull() ?: 0
-            val assists = values[2].value.toIntOrNull() ?: 0
+            val deaths = values[1].value.toIntOrNull()
+            val assists = values[2].value.toIntOrNull()
             createReading(
                 kills = killsDigit ?: -1,
-                deaths = deaths,
-                assists = assists,
+                deaths = deaths ?: -1,
+                assists = assists ?: -1,
                 tokens = listOf(token),
                 confidence = token.confidence,
                 rawText = token.text,
                 firstChar = rawPart1.trim(),
-                isFirstDigitValid = killsDigit != null
+                isFirstDigitValid = killsDigit != null,
+                isTripletNumericallyValid = killsDigit != null && deaths != null && assists != null
             )
         }
         val individualTokens = validTokens.flatMap { token ->
@@ -438,8 +575,13 @@ object KdaSpatialParser {
                 val previous = segment?.lastOrNull()
                 if (
                     previous == null ||
-                    token.boxLeft - previous.boxRight <=
-                    frameWidth * MAX_NUMBER_GAP_FRACTION
+                    token.boxLeft - previous.boxRight <= minOf(
+                        frameWidth * MAX_NUMBER_GAP_FRACTION,
+                        maxOf(
+                            token.boxBottom - token.boxTop,
+                            previous.boxBottom - previous.boxTop
+                        ) * MAX_NUMBER_GAP_TOKEN_HEIGHTS
+                    )
                 ) {
                     if (segment == null) result += mutableListOf(token) else segment += token
                 } else {
@@ -451,19 +593,20 @@ object KdaSpatialParser {
                 if (segment.size != 3) return@mapNotNull null
                 val rawPart1 = segment[0].text.trim()
                 val killsDigit = normalizeFirstDigit(rawPart1)
-                val deaths = segment[1].text.trim().toIntOrNull() ?: 0
-                val assists = segment[2].text.trim().toIntOrNull() ?: 0
+                val deaths = segment[1].text.trim().toIntOrNull()
+                val assists = segment[2].text.trim().toIntOrNull()
                 val confidence = segment.map(KdaNumberToken::confidence).average().toFloat()
                 val rawText = segment.joinToString(" ") { it.text }
                 createReading(
                     kills = killsDigit ?: -1,
-                    deaths = deaths,
-                    assists = assists,
+                    deaths = deaths ?: -1,
+                    assists = assists ?: -1,
                     tokens = segment,
                     confidence = confidence,
                     rawText = rawText,
                     firstChar = rawPart1,
-                    isFirstDigitValid = killsDigit != null
+                    isFirstDigitValid = killsDigit != null,
+                    isTripletNumericallyValid = killsDigit != null && deaths != null && assists != null
                 )
             }
         }
@@ -502,7 +645,8 @@ object KdaSpatialParser {
         confidence: Float,
         rawText: String = "",
         firstChar: String = "",
-        isFirstDigitValid: Boolean = true
+        isFirstDigitValid: Boolean = true,
+        isTripletNumericallyValid: Boolean = isFirstDigitValid
     ): KdaReading? {
         if (tokens.isEmpty()) return null
         val first = tokens.first()
@@ -529,7 +673,8 @@ object KdaSpatialParser {
             boxBottom = maxBottom,
             rawText = rawText,
             firstChar = firstChar,
-            isFirstDigitValid = isFirstDigitValid
+            isFirstDigitValid = isFirstDigitValid,
+            isTripletNumericallyValid = isTripletNumericallyValid
         )
     }
 }

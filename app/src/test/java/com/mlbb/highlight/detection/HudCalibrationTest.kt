@@ -37,4 +37,21 @@ class HudCalibrationTest {
         assertEquals(1824, pixelBounds.right)
         assertEquals(162, pixelBounds.bottom)
     }
+
+    @Test
+    fun activeViewportFindsLetterboxedGameplayBandInPortraitVideo() {
+        val litRows = (480..680 step 5).toList()
+
+        val bounds = inferActiveSpanBounds(
+            samples = litRows,
+            dimension = 1_280,
+            sampleStep = 5,
+            minimumFraction = 0.10f,
+            minimumSamples = 16
+        )
+
+        assertNotNull(bounds)
+        assertEquals(475, bounds!!.first)
+        assertEquals(686, bounds.second)
+    }
 }

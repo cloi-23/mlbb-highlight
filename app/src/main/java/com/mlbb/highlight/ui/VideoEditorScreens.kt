@@ -13,7 +13,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -35,8 +39,10 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RangeSlider
 import androidx.compose.material3.Slider
@@ -66,6 +72,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.Image
 import androidx.media3.common.C
@@ -528,6 +535,7 @@ fun VideoTimeline(
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun EffectsScreen(
     editState: VideoEditState,
     effectStartMs: Long,
@@ -561,7 +569,13 @@ fun EffectsScreen(
     val effectPipeline = remember(editState) {
         buildVideoEffects(editState, EffectTimestampBasis.SOURCE_VIDEO)
     }
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    var activeTool by remember { mutableStateOf("Scene") }
+    var showToolPanel by remember { mutableStateOf(false) }
+    val toolNames = listOf("Scene", "Effect", "Adjust", "Motion", "Range")
+    Column(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
         EditorScreenHeader(
             title = "Effects",
             onBack = onBack,
@@ -570,8 +584,6 @@ fun EffectsScreen(
                 if (endMs > startMs) onEffectRangeChanged(0L, endMs - startMs)
             }
         )
-        Text("Select a scene, choose an effect, preview, then export.", color = RecorderTheme.textSecondary)
-
         if (videoUri == null) {
             EmptyEditorCard(
                 title = "No video selected",
@@ -580,7 +592,6 @@ fun EffectsScreen(
                 onClick = onGoToTrim
             )
         } else {
-            val previewSceneStartMs = startMs + (selectedScene?.startMs ?: effectStartMs)
             VideoPreview(
                 videoUri = videoUri,
                 startMs = startMs,
@@ -591,108 +602,90 @@ fun EffectsScreen(
                 onPositionChanged = { position ->
                     onPlayheadChanged((position - startMs).coerceIn(0L, (endMs - startMs).coerceAtLeast(0L)))
                 },
-                previewSeekMs = previewSceneStartMs,
-                previewRequestId = previewRequestId
+                previewSeekMs = startMs + (selectedScene?.startMs ?: effectStartMs),
+                previewRequestId = previewRequestId,
+                previewMaxHeight = 420.dp
             )
             if (sceneEffects.any { it.options.preset != VideoEffectPreset.NONE }) {
-                Text(
-                    "Effects update the preview on their assigned scenes. Slow motion applies only inside its selected range.",
-                    color = RecorderTheme.cyan,
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text("Effects are applied to their scenes. Slow motion stays within its selected range.",
+                    color = RecorderTheme.cyan, style = MaterialTheme.typography.bodySmall)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                toolNames.forEach { tool ->
+                    FilterChip(selected = activeTool == tool && showToolPanel,
+                        onClick = { activeTool = tool; showToolPanel = true },
+                        label = { EffectToolLabel(tool) })
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = {
-                        val clipDuration = (endMs - startMs).coerceAtLeast(0L)
-                        if (clipDuration > 0L) {
-                            val id = "scene-${System.currentTimeMillis()}"
-                            val sceneStart = (playheadMs - 200L).coerceIn(0L, clipDuration)
-                            val sceneEnd = (playheadMs + 350L).coerceIn(sceneStart, clipDuration)
-                            val manual = SceneEffect(
-                                id = id,
-                                label = "Scene ${sceneEffects.count { it.eventTimeMs == null } + 1}",
-                                eventTimeMs = null,
-                                startMs = sceneStart,
-                                endMs = sceneEnd
-                            )
-                            onSceneEffectsChanged(sceneEffects + manual)
-                            onSceneSelected(manual)
-                        }
-                    },
-                    enabled = endMs > startMs && !isExporting
-                ) {
-                    Text("Select Scene")
+                Button(onClick = onApplyPreview, enabled = endMs > startMs && !isExporting) {
+                    Text("Preview Effects")
                 }
-            }
-            if (sceneEffects.isNotEmpty()) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    sceneEffects.forEach { scene ->
-                        FilterChip(
-                            selected = scene.id == selectedSceneId,
-                            onClick = { onSceneSelected(scene) },
-                            label = { Text(scene.label) }
-                        )
-                    }
+                OutlinedButton(onClick = onExport,
+                    enabled = endMs > startMs && !isExporting && isPreviewApplied) {
+                    Text(if (isExporting) "Exporting…" else if (isPreviewApplied) "Export MP4" else "Preview first")
                 }
-            }
-            VideoTimeline(
-                context = LocalContext.current,
-                videoUri = videoUri,
-                sourceStartMs = startMs,
-                durationMs = (endMs - startMs).coerceAtLeast(0L),
-                startMs = effectStartMs,
-                endMs = effectEndMs,
-                onTrimChanged = onEffectRangeChanged,
-                markerTimesMs = sceneEffects.mapNotNull { it.eventTimeMs },
-                playheadMs = playheadMs
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(formatEditorTime(effectStartMs), color = RecorderTheme.textSecondary)
-                Text("Selected scene", color = RecorderTheme.cyan)
-                Text(formatEditorTime(endMs - startMs), color = RecorderTheme.textSecondary)
             }
         }
+        if (isExporting) {
+            LinearProgressIndicator(progress = { exportProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+            Text(exportMessage ?: "Exporting video…", color = RecorderTheme.textSecondary)
+        } else if (exportMessage != null) Text(exportMessage, color = RecorderTheme.textSecondary)
+        if (!isExporting && exportMessage?.startsWith("Export saved") == true) {
+            OutlinedButton(onClick = onOpenVideos, modifier = Modifier.fillMaxWidth()) { Text("View My Videos") }
+        }
+    }
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = RecorderTheme.surface),
-            shape = RoundedCornerShape(20.dp)
+    if (showToolPanel && videoUri != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showToolPanel = false },
+            containerColor = RecorderTheme.background,
+            contentColor = RecorderTheme.textPrimary
         ) {
             Column(
-                modifier = Modifier.padding(16.dp),
+                modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp).padding(bottom = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text(
-                    selectedScene?.let { "Effect · ${it.label}" } ?: "Choose a scene first",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = RecorderTheme.textPrimary
-                )
-                if (selectedScene != null) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(
-                            onClick = {
-                                onSceneEffectsChanged(
-                                    sceneEffects.map { scene ->
-                                        if (scene.id == selectedScene.id) {
-                                            scene.copy(eventTimeMs = playheadMs.coerceIn(scene.startMs, scene.endMs))
-                                        } else scene
-                                    }
-                                )
-                            }
-                        ) { Text("Set event") }
-                        OutlinedButton(
-                            onClick = {
-                                val remaining = sceneEffects.filterNot { it.id == selectedScene.id }
-                                onSceneEffectsChanged(remaining)
-                                remaining.firstOrNull()?.let(onSceneSelected)
-                            }
-                        ) { Text("Remove scene") }
+                Row(modifier = Modifier.horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    toolNames.forEach { tool ->
+                        FilterChip(selected = activeTool == tool, onClick = { activeTool = tool },
+                            label = { EffectToolLabel(tool) })
                     }
                 }
+                Text("${activeTool} · ${selectedScene?.label ?: "Choose a scene"}",
+                    style = MaterialTheme.typography.titleMedium)
+                if (activeTool == "Scene") {
+                    Button(onClick = {
+                        val duration = (endMs - startMs).coerceAtLeast(0L)
+                        if (duration > 0L) {
+                            val start = (playheadMs - 200L).coerceIn(0L, duration)
+                            val scene = SceneEffect("scene-${System.currentTimeMillis()}",
+                                "Scene ${sceneEffects.size + 1}", null, start,
+                                (playheadMs + 350L).coerceIn(start, duration))
+                            onSceneEffectsChanged(sceneEffects + scene); onSceneSelected(scene)
+                        }
+                    }, enabled = endMs > startMs && !isExporting, modifier = Modifier.fillMaxWidth()) {
+                        Text("Add scene at playhead")
+                    }
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        sceneEffects.forEach { scene -> FilterChip(selected = scene.id == selectedSceneId,
+                            onClick = { onSceneSelected(scene) }, label = { Text(scene.label) }) }
+                    }
+                    if (selectedScene != null) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { onSceneEffectsChanged(sceneEffects.map { scene ->
+                            if (scene.id == selectedScene.id) scene.copy(eventTimeMs = playheadMs.coerceIn(scene.startMs, scene.endMs)) else scene
+                        }) }) { Text("Set event here") }
+                        OutlinedButton(onClick = { val remaining = sceneEffects.filterNot { it.id == selectedScene.id }
+                            onSceneEffectsChanged(remaining); remaining.firstOrNull()?.let(onSceneSelected) }) { Text("Remove scene") }
+                    }
+                }
+                if (activeTool == "Effect") {
                 val effectRows = listOf(
                     listOf(VideoEffectPreset.IMPACT, VideoEffectPreset.SHAKE, VideoEffectPreset.FLASH),
                     listOf(VideoEffectPreset.SLOW_MOTION, VideoEffectPreset.ZOOM, VideoEffectPreset.GLOW),
@@ -721,15 +714,20 @@ fun EffectsScreen(
                         }
                     }
                 }
-                if (selectedScene != null && options.preset != VideoEffectPreset.NONE) {
-                    Text("Intensity · ${(options.intensity * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.intensity,
-                        onValueChange = { onOptionsChanged(options.copy(intensity = it)) },
-                        valueRange = 0.1f..1f
-                    )
                 }
-                if (selectedScene != null && options.usesSlowMotion()) {
+                if (selectedScene != null && activeTool == "Adjust") {
+                    Text("Intensity · ${(options.intensity * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(value = options.intensity, onValueChange = { onOptionsChanged(options.copy(intensity = it)) }, valueRange = 0.1f..1f)
+                    Text("Color grading · ${(options.colorGrading * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+                    Slider(value = options.colorGrading, onValueChange = { onOptionsChanged(options.copy(colorGrading = it)) })
+                    if (options.preset == VideoEffectPreset.BLUR) AdjustmentSlider("Blur", options.blurAmount) { onOptionsChanged(options.copy(blurAmount = it)) }
+                    if (options.preset == VideoEffectPreset.BRIGHTNESS) AdjustmentSlider("Brightness", options.brightnessAmount) { onOptionsChanged(options.copy(brightnessAmount = it)) }
+                    if (options.preset == VideoEffectPreset.CONTRAST) AdjustmentSlider("Contrast", options.contrastAmount) { onOptionsChanged(options.copy(contrastAmount = it)) }
+                    if (options.preset == VideoEffectPreset.SATURATION) AdjustmentSlider("Saturation", options.saturationAmount) { onOptionsChanged(options.copy(saturationAmount = it)) }
+                    if (options.preset in setOf(VideoEffectPreset.FLASH, VideoEffectPreset.IMPACT, VideoEffectPreset.KILL_IMPACT, VideoEffectPreset.IMPACT_OVERLAY, VideoEffectPreset.SAVAGE)) AdjustmentSlider("Opacity", options.opacity) { onOptionsChanged(options.copy(opacity = it)) }
+                }
+                if (selectedScene != null && activeTool == "Motion") {
+                if (options.usesSlowMotion()) {
                     Text("Slow motion · ${(options.slowMotionSpeed * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
                     Slider(
                         value = options.slowMotionSpeed,
@@ -737,9 +735,7 @@ fun EffectsScreen(
                         valueRange = 0.25f..0.9f
                     )
                 }
-                if (
-                    selectedScene != null &&
-                    options.preset in setOf(
+                if (options.preset in setOf(
                         VideoEffectPreset.ZOOM,
                         VideoEffectPreset.IMPACT,
                         VideoEffectPreset.KILL_IMPACT,
@@ -754,9 +750,7 @@ fun EffectsScreen(
                         valueRange = 1.01f..1.2f
                     )
                 }
-                if (
-                    selectedScene != null &&
-                    options.preset in setOf(
+                if (options.preset in setOf(
                         VideoEffectPreset.SHAKE,
                         VideoEffectPreset.IMPACT,
                         VideoEffectPreset.KILL_IMPACT,
@@ -769,89 +763,45 @@ fun EffectsScreen(
                         onValueChange = { onOptionsChanged(options.copy(shakeAmount = it)) }
                     )
                 }
-                if (
-                    selectedScene != null &&
-                    options.preset in setOf(
-                        VideoEffectPreset.FLASH,
-                        VideoEffectPreset.IMPACT,
-                        VideoEffectPreset.KILL_IMPACT,
-                        VideoEffectPreset.IMPACT_OVERLAY,
-                        VideoEffectPreset.SAVAGE
-                    )
-                ) {
-                    Text("Opacity · ${(options.opacity * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.opacity,
-                        onValueChange = { onOptionsChanged(options.copy(opacity = it)) }
-                    )
                 }
-                if (selectedScene != null && options.preset == VideoEffectPreset.BLUR) {
-                    Text("Blur · ${(options.blurAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.blurAmount,
-                        onValueChange = { onOptionsChanged(options.copy(blurAmount = it)) }
-                    )
+                if (activeTool == "Range") {
+                    Text("Trim applied: ${formatEditorTime(startMs)}–${formatEditorTime(endMs)}", color = RecorderTheme.textSecondary)
+                    VideoTimeline(context = context, videoUri = videoUri, sourceStartMs = startMs,
+                        durationMs = (endMs - startMs).coerceAtLeast(0L), startMs = effectStartMs,
+                        endMs = effectEndMs, onTrimChanged = onEffectRangeChanged,
+                        markerTimesMs = sceneEffects.mapNotNull { it.eventTimeMs }, playheadMs = playheadMs)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(formatEditorTime(effectStartMs), color = RecorderTheme.textSecondary)
+                        Text("Selected range", color = RecorderTheme.cyan)
+                        Text(formatEditorTime(endMs - startMs), color = RecorderTheme.textSecondary)
+                    }
                 }
-                if (selectedScene != null && options.preset == VideoEffectPreset.BRIGHTNESS) {
-                    Text("Brightness · ${(options.brightnessAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.brightnessAmount,
-                        onValueChange = { onOptionsChanged(options.copy(brightnessAmount = it)) }
-                    )
-                }
-                if (selectedScene != null && options.preset == VideoEffectPreset.CONTRAST) {
-                    Text("Contrast · ${(options.contrastAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.contrastAmount,
-                        onValueChange = { onOptionsChanged(options.copy(contrastAmount = it)) }
-                    )
-                }
-                if (selectedScene != null && options.preset == VideoEffectPreset.SATURATION) {
-                    Text("Saturation · ${(options.saturationAmount * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
-                    Slider(
-                        value = options.saturationAmount,
-                        onValueChange = { onOptionsChanged(options.copy(saturationAmount = it)) }
-                    )
-                }
+                if (selectedScene != null) OutlinedButton(onClick = {
+                    onOptionsChanged(VideoEffectOptions(preset = options.preset))
+                }, modifier = Modifier.fillMaxWidth()) { Text("Reset adjustments") }
             }
         }
+    }
+}
 
-        if (isExporting) {
-            LinearProgressIndicator(
-                progress = { exportProgress.coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text(exportMessage ?: "Exporting video…", color = RecorderTheme.textSecondary)
-        } else if (exportMessage != null) {
-            Text(exportMessage, color = RecorderTheme.textSecondary)
-        }
-        if (!isExporting && exportMessage?.startsWith("Export saved") == true) {
-            OutlinedButton(
-                onClick = onOpenVideos,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("View My Videos")
-            }
-        }
+@Composable
+private fun AdjustmentSlider(label: String, value: Float, onChange: (Float) -> Unit) {
+    Text("$label · ${(value * 100).roundToLong()}%", color = RecorderTheme.textSecondary)
+    Slider(value = value, onValueChange = onChange)
+}
 
-        Button(
-            onClick = onApplyPreview,
-            enabled = videoUri != null && endMs > startMs &&
-                sceneEffects.any {
-                    it.endMs > it.startMs && it.options.preset != VideoEffectPreset.NONE
-                } && !isExporting,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Preview Effects")
-        }
-        OutlinedButton(
-            onClick = onExport,
-            enabled = videoUri != null && endMs > startMs &&
-                effectEndMs > effectStartMs && !isExporting && isPreviewApplied,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(if (isExporting) "Exporting…" else if (isPreviewApplied) "Export MP4" else "Preview before Export")
-        }
+@Composable
+private fun EffectToolLabel(tool: String) {
+    val icon = when (tool) {
+        "Scene" -> Icons.Outlined.Crop
+        "Effect" -> Icons.Outlined.AutoAwesome
+        "Adjust" -> Icons.Outlined.LinearScale
+        "Motion" -> Icons.Outlined.PlayArrow
+        else -> Icons.Outlined.ContentCut
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp))
+        Text(tool)
     }
 }
 
@@ -903,7 +853,10 @@ fun VideoPreview(
     speedProvider: SpeedProvider? = null,
     previewSeekMs: Long = startMs,
     onPositionChanged: (Long) -> Unit = {},
-    previewRequestId: Int = 0
+    previewRequestId: Int = 0,
+    autoPlay: Boolean = false,
+    showPlaybackControls: Boolean = true,
+    previewMaxHeight: Dp = 640.dp
 ) {
     val context = LocalContext.current
     val currentOnDurationChanged by rememberUpdatedState(onDurationChanged)
@@ -922,9 +875,18 @@ fun VideoPreview(
         }
     }
     var durationMs by remember(videoUri) { mutableLongStateOf(0L) }
-    var playing by remember(videoUri) { mutableStateOf(false) }
+    var playing by remember(videoUri) { mutableStateOf(autoPlay) }
     var appliedPlaybackSpeed by remember(player) { mutableFloatStateOf(1f) }
     var videoAspectRatio by remember(videoUri) { mutableFloatStateOf(16f / 9f) }
+    val sliderStartMs = startMs.coerceAtLeast(0L)
+    val requestedSliderEndMs = endMs.takeIf { it > sliderStartMs }
+        ?: durationMs.takeIf { it > sliderStartMs }
+        ?: (sliderStartMs + 1L)
+    val sliderEndMs = if (durationMs > sliderStartMs) {
+        requestedSliderEndMs.coerceAtMost(durationMs).coerceAtLeast(sliderStartMs + 1L)
+    } else {
+        requestedSliderEndMs.coerceAtLeast(sliderStartMs + 1L)
+    }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -979,11 +941,16 @@ fun VideoPreview(
         }
     }
 
-    LaunchedEffect(player, previewRequestId) {
+    LaunchedEffect(player, previewRequestId, showPlaybackControls) {
         if (previewRequestId > 0) {
+            if (!showPlaybackControls) player.pause()
             player.seekTo(previewSeekMs.coerceIn(startMs, endMs))
-            player.play()
+            if (showPlaybackControls) player.play()
         }
+    }
+
+    LaunchedEffect(player, autoPlay) {
+        playing = autoPlay
     }
 
     LaunchedEffect(playing, player) {
@@ -1001,7 +968,7 @@ fun VideoPreview(
         ) {
             BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
                 val previewHeight = (maxWidth.value / videoAspectRatio.coerceAtLeast(0.1f))
-                    .coerceIn(160f, 640f)
+                    .coerceIn(160f, previewMaxHeight.value.coerceAtLeast(160f))
                     .dp
                 Box(
                     modifier = Modifier
@@ -1021,7 +988,7 @@ fun VideoPreview(
                         },
                         update = { it.player = player }
                     )
-                    if (!playing) {
+                    if (showPlaybackControls && !playing) {
                         IconButton(
                             onClick = {
                                 if (player.currentPosition < startMs || player.currentPosition >= endMs) {
@@ -1041,21 +1008,24 @@ fun VideoPreview(
                     }
                 }
             }
-            Row(
+            if (showPlaybackControls) Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    formatEditorTime(positionMs),
+                    formatEditorTime(positionMs.coerceIn(sliderStartMs, sliderEndMs)),
                     color = RecorderTheme.textSecondary
                 )
                 Slider(
-                    value = positionMs.toFloat().coerceIn(0f, durationMs.coerceAtLeast(1L).toFloat()),
+                    value = positionMs.toFloat().coerceIn(
+                        sliderStartMs.toFloat(),
+                        sliderEndMs.toFloat()
+                    ),
                     onValueChange = { player.seekTo(it.roundToLong()) },
-                    valueRange = 0f..durationMs.coerceAtLeast(1L).toFloat(),
+                    valueRange = sliderStartMs.toFloat()..sliderEndMs.toFloat(),
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                 )
-                Text(formatEditorTime(durationMs), color = RecorderTheme.textSecondary)
+                Text(formatEditorTime(sliderEndMs), color = RecorderTheme.textSecondary)
                 IconButton(
                     onClick = {
                         if (playing) {

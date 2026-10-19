@@ -86,7 +86,7 @@ class KdaSpatialParserTest {
 
     @Test
     fun letterMisreadsInFirstPositionAreTreatedAsUncertainInsteadOfNumber() {
-        val formats = listOf("O/0/0", "o/o/o", "S/2/7", "B/1/3")
+        val formats = listOf("O/0/0", "o/o/o", "S/2/7", "B/1/3", "X/0/0")
         formats.forEach { raw ->
             val tok = token(raw, 100, 10, 200, 30, 0.85f)
             val result = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080)
@@ -100,11 +100,12 @@ class KdaSpatialParserTest {
     }
 
     @Test
-    fun implausibleMergedKillCountIsUncertainInsteadOfBeingCountedAsFortyEight() {
+    fun validTwoDigitKillCounterIsNotHardCapped() {
         val tok = token("48/0/0", 100, 10, 200, 30, 0.95f)
         val reading = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080).readings.single()
-        assertEquals(-1, reading.kills)
-        org.junit.Assert.assertFalse(reading.isFirstDigitValid)
+        assertEquals(48, reading.kills)
+        org.junit.Assert.assertTrue(reading.isFirstDigitValid)
+        org.junit.Assert.assertTrue(reading.isTripletNumericallyValid)
     }
 
     @Test
@@ -113,5 +114,75 @@ class KdaSpatialParserTest {
         val reading = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080).readings.single()
         assertEquals(10, reading.kills)
         org.junit.Assert.assertTrue(reading.isFirstDigitValid)
+    }
+
+    @Test
+    fun doesNotSilentlyTurnNonNumericDeathOrAssistIntoZero() {
+        val reading = KdaSpatialParser.parseDetailed(
+            listOf(token("4/0/O", 100, 10, 200, 30, 0.95f)),
+            1920,
+            1080
+        ).readings.single()
+
+        assertEquals(4, reading.kills)
+        assertEquals(0, reading.deaths)
+        assertEquals(-1, reading.assists)
+        org.junit.Assert.assertFalse(reading.isTripletNumericallyValid)
+    }
+
+    @Test
+    fun stripsKillIconXWhenItIsAttachedToTheFirstDigit() {
+        val tok = token("x1 01", 100, 10, 200, 30, 0.90f)
+        val reading = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080).readings.single()
+        assertEquals(1, reading.kills)
+        assertEquals(0, reading.deaths)
+        assertEquals(1, reading.assists)
+        assertTrue(reading.isFirstDigitValid)
+    }
+
+    @Test
+    fun ignoresCrossedSwordsIconBeforeZeroKillCount() {
+        val tok = token("x0 00", 100, 10, 200, 30, 0.90f)
+        val reading = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080).readings.single()
+        assertEquals(0, reading.kills)
+        assertEquals(0, reading.deaths)
+        assertEquals(0, reading.assists)
+        assertTrue(reading.isFirstDigitValid)
+    }
+
+    @Test
+    fun readsCrossedSwordsKdaWithTwoDigitAssists() {
+        val tok = token("X 6 2 11", 100, 10, 200, 30, 0.90f)
+        val reading = KdaSpatialParser.parseDetailed(listOf(tok), 1920, 1080).readings.single()
+        assertEquals(6, reading.kills)
+        assertEquals(2, reading.deaths)
+        assertEquals(11, reading.assists)
+        assertTrue(reading.isFirstDigitValid)
+    }
+
+    @Test
+    fun spatialParserDoesNotJoinUnrelatedHudNumbersAcrossLargeGaps() {
+        val result = KdaSpatialParser.parseDetailed(
+            listOf(
+                token("4", 100, 10, 120, 30, 0.95f),
+                token("2", 360, 10, 380, 30, 0.95f),
+                token("9", 620, 10, 640, 30, 0.95f)
+            ),
+            1920,
+            1080
+        )
+
+        assertTrue(result.readings.isEmpty())
+    }
+
+    @Test
+    fun directTripletMustConsumeTheWholeOcrToken() {
+        val result = KdaSpatialParser.parseDetailed(
+            listOf(token("4 2 9 99", 100, 10, 240, 30, 0.95f)),
+            1920,
+            1080
+        )
+
+        assertTrue(result.readings.isEmpty())
     }
 }

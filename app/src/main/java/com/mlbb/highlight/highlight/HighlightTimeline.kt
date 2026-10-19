@@ -23,9 +23,16 @@ enum class HighlightEventOrigin {
 data class HighlightEvent(
     val id: String,
     val type: HighlightEventType,
+    /** Estimated location of the counter transition inside its observation interval. */
     val sourceTimeMs: Long,
     val confidence: Float,
-    val origin: HighlightEventOrigin
+    val origin: HighlightEventOrigin,
+    val killsAdded: Int? = null,
+    val previousKillCount: Int? = null,
+    val currentKillCount: Int? = null,
+    val counterObservedFromMs: Long? = null,
+    val counterConfirmedAtMs: Long? = null,
+    val counterFirstObservedAtMs: Long? = null
 )
 
 enum class HighlightStyle(val label: String) {
@@ -57,9 +64,9 @@ data class EffectPreset(
     val name: String,
     val videoPreset: VideoEffectPreset,
     val intensity: EffectIntensity = EffectIntensity.MEDIUM,
-    val slowMotionSpeed: Float = 0.55f,
+    val slowMotionSpeed: Float = 0.25f,
     val zoomAmount: Float = 0.08f,
-    val shakeAmount: Float = 0.2f
+    val shakeAmount: Float = 1.0f
 ) {
     fun toVideoOptions(): VideoEffectOptions {
         val level = intensity.value
@@ -158,13 +165,27 @@ data class HighlightClip(
     val effectPreset: EffectPreset,
     val speedCurve: SpeedCurve,
     val audioCues: List<AudioCue> = emptyList(),
-    val textOverlay: TextOverlay? = null
+    val textOverlay: TextOverlay? = null,
+    /** Original detected time, retained so timing adjustments stay relative to analysis. */
+    val detectedEventTimeMs: Long = eventTimeMs
 ) {
     val durationMs: Long
         get() = (endMs - startMs).coerceAtLeast(0L)
 
     val primaryEvent: HighlightEvent?
         get() = events.maxByOrNull { eventPriority(it.type) }
+}
+
+fun HighlightClip.withEventTimingOffset(offsetMs: Long): HighlightClip {
+    val adjustedEventTimeMs = (detectedEventTimeMs + offsetMs)
+        .coerceIn(startMs, (endMs - 1L).coerceAtLeast(startMs))
+    val deltaMs = adjustedEventTimeMs - eventTimeMs
+    val adjustedSpeedCurve = speedCurve.copy(
+        points = speedCurve.points.map { point ->
+            point.copy(timeMs = (point.timeMs + deltaMs).coerceIn(0L, durationMs))
+        }.distinctBy { it.timeMs }.sortedBy { it.timeMs }
+    )
+    return copy(eventTimeMs = adjustedEventTimeMs, speedCurve = adjustedSpeedCurve)
 }
 
 data class HighlightTimeline(
@@ -177,10 +198,11 @@ data class HighlightTimeline(
     val resolution: HighlightResolution = HighlightResolution.P1080,
     val musicUri: String? = null,
     val musicVolume: Float = 0.13f,
+    val killSoundVolume: Float = 0.65f,
     val enableScreenShake: Boolean = true,
     val enableSlowMotion: Boolean = true,
     val enableImpactFlash: Boolean = true,
-    val enableKillSound: Boolean = false,
+    val enableKillSound: Boolean = true,
     val enableBackgroundMusic: Boolean = false,
     val preserveOriginalGameplay: Boolean = true
 ) {

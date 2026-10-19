@@ -8,33 +8,39 @@ import org.junit.Test
 
 class MyKdaTrackerTest {
     @Test
-    fun killFeedBannerDoesNotTriggerWithoutPersonalKillIncrease() {
-        listOf(
-            HighlightEventType.FIRST_BLOOD,
-            HighlightEventType.KILL,
-            HighlightEventType.DOUBLE_KILL,
-            HighlightEventType.TRIPLE_KILL,
-            HighlightEventType.MANIAC,
-            HighlightEventType.SAVAGE
-        ).forEach { banner ->
-            val tracker = MyKdaTracker()
-            repeat(3) {
-                tracker.observe(
-                    listOf(candidate(5, 2, 3)),
-                    sourceTimeMs = 1_000L + it * 1_000L
-                )
-            }
+    fun twoSampleModeConfirmsLiveDeathAndKillWithoutThreeSampleWait() {
+        val tracker = MyKdaTracker(requiredStableReadings = 2)
+        tracker.observe(listOf(candidate(0, 0, 0)), 1_000L)
+        val baseline = tracker.observe(listOf(candidate(0, 0, 0)), 2_000L)
+        assertEquals(KdaSnapshot(0, 0, 0), baseline.current)
 
-            val update = tracker.observe(
+        val firstChangedRead = tracker.observe(listOf(candidate(1, 1, 0)), 3_000L)
+        assertNull(firstChangedRead.killEvent)
+        val confirmed = tracker.observe(listOf(candidate(1, 1, 0)), 4_000L)
+
+        assertEquals(KdaSnapshot(1, 1, 0), confirmed.current)
+        assertEquals(HighlightEventType.KILL, confirmed.killEvent?.type)
+        assertEquals(1, confirmed.killEvent?.killsAdded)
+    }
+
+    @Test
+    fun unchangedPersonalKdaDoesNotCreateKillEvent() {
+        val tracker = MyKdaTracker()
+        repeat(3) {
+            tracker.observe(
                 listOf(candidate(5, 2, 3)),
-                sourceTimeMs = 4_000L,
-                supportingBanner = banner
+                sourceTimeMs = 1_000L + it * 1_000L
             )
-
-            assertNull("$banner must not trigger by itself", update.killEvent)
-            assertEquals(KdaSnapshot(5, 2, 3), update.baseline)
-            assertEquals(KdaSnapshot(5, 2, 3), update.current)
         }
+
+        val update = tracker.observe(
+            listOf(candidate(5, 2, 3)),
+            sourceTimeMs = 4_000L
+        )
+
+        assertNull(update.killEvent)
+        assertEquals(KdaSnapshot(5, 2, 3), update.baseline)
+        assertEquals(KdaSnapshot(5, 2, 3), update.current)
     }
 
     @Test
@@ -43,23 +49,24 @@ class MyKdaTrackerTest {
         repeat(3) { tracker.observe(listOf(candidate(7, 3, 4)), sourceTimeMs = 1_000L + it * 1_000L) }
 
         assertNull(
-            tracker.observe(listOf(candidate(7, 4, 4)), sourceTimeMs = 2_000L).killEvent
+            tracker.observe(listOf(candidate(7, 4, 4)), sourceTimeMs = 4_000L).killEvent
         )
         assertNull(
-            tracker.observe(listOf(candidate(7, 4, 5)), sourceTimeMs = 3_000L).killEvent
+            tracker.observe(listOf(candidate(7, 4, 5)), sourceTimeMs = 5_000L).killEvent
         )
 
-        val kill = (4..6).map { sample ->
+        val kill = (6..8).map { sample ->
             tracker.observe(
                 listOf(candidate(8, 4, 5)),
-                sourceTimeMs = sample * 1_000L,
-                supportingBanner = if (sample == 6) HighlightEventType.DOUBLE_KILL else null
+                sourceTimeMs = sample * 1_000L
             ).killEvent
         }.filterNotNull().single()
         assertEquals(HighlightEventType.KILL, kill?.type)
-        assertEquals(4_000L, kill?.sourceTimeMs)
+        assertEquals(5_500L, kill?.sourceTimeMs)
+        assertEquals(6_000L, kill?.counterFirstObservedAtMs)
+        assertEquals(8_000L, kill?.counterConfirmedAtMs)
 
-        assertNull(tracker.observe(listOf(candidate(8, 4, 5)), sourceTimeMs = 7_000L).killEvent)
+        assertNull(tracker.observe(listOf(candidate(8, 4, 5)), sourceTimeMs = 9_000L).killEvent)
     }
 
     @Test
@@ -104,15 +111,14 @@ class MyKdaTrackerTest {
     }
 
     @Test
-    fun killBannerDoesNotChangeKillCounterMomentType() {
+    fun killCounterIncreaseCreatesGenericKillEvent() {
         val tracker = MyKdaTracker()
         repeat(3) { tracker.observe(listOf(candidate(2, 0, 1)), sourceTimeMs = 1_000L + it * 1_000L) }
 
         val update = (4..6).map { sample ->
             tracker.observe(
                 listOf(candidate(3, 0, 1)),
-                sourceTimeMs = sample * 1_000L,
-                supportingBanner = if (sample == 6) HighlightEventType.SAVAGE else null
+                sourceTimeMs = sample * 1_000L
             )
         }.last()
 
@@ -157,19 +163,31 @@ class MyKdaTrackerTest {
     }
 
     @Test
-    fun counterJumpDoesNotCreateAnUnverifiedMomentAndRequestsReview() {
+    fun stableCounterJumpEmitsOneBundledTransitionEvent() {
         val tracker = MyKdaTracker()
         repeat(3) { tracker.observe(listOf(candidate(5, 2, 3)), sourceTimeMs = 1_000L + it * 1_000L) }
         val confirmed = (4..6).map { sample ->
             tracker.observe(listOf(candidate(7, 2, 3)), sourceTimeMs = sample * 1_000L)
         }
 
-        assertTrue(confirmed.all { it.killEvent == null })
-        assertTrue(confirmed.last().decision.startsWith("Kill increase needs review: counter jumped"))
-        assertNull(tracker.lastKillCurrent)
+        assertTrue(confirmed.take(2).all { it.killEvent == null })
+        val jumpEvent = confirmed.last().killEvent
+        assertEquals(HighlightEventType.KILL, jumpEvent?.type)
+        assertTrue(confirmed.last().decision.contains("individual kill times unknown"))
+        assertEquals(KdaSnapshot(7, 2, 3), confirmed.last().current)
+        val observed = confirmed.last().counterIncrease
+        assertEquals(2, observed?.killsAdded)
+        assertEquals(4_000L, observed?.firstObservedAtMs)
+        assertEquals(6_000L, observed?.confirmedAtMs)
+        assertEquals(3_000L, observed?.previousObservedAtMs)
         assertEquals(7, tracker.lastConfirmedKills)
+        assertEquals(2, jumpEvent?.killsAdded)
+        assertEquals(3_500L, jumpEvent?.sourceTimeMs)
+        assertEquals(4_000L, jumpEvent?.counterFirstObservedAtMs)
+        assertEquals(6_000L, jumpEvent?.counterConfirmedAtMs)
+        assertNull(tracker.observe(listOf(candidate(7, 2, 3)), 7_000L).killEvent)
 
-        val nextSequentialKill = (7..9).mapNotNull { sample ->
+        val nextSequentialKill = (8..10).mapNotNull { sample ->
             tracker.observe(listOf(candidate(8, 2, 3)), sourceTimeMs = sample * 1_000L).killEvent
         }.single()
         assertEquals(HighlightEventType.KILL, nextSequentialKill.type)
@@ -210,7 +228,38 @@ class MyKdaTrackerTest {
     }
 
     @Test
-    fun lowConfidenceKillIncreaseIsShownForReviewAndCanConfirmLater() {
+    fun duplicateSourceTimestampDoesNotCountAsAnotherStableFrame() {
+        val tracker = MyKdaTracker()
+        repeat(3) { tracker.observe(listOf(candidate(0, 0, 0)), sourceTimeMs = 1_000L + it * 1_000L) }
+
+        val first = tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 4_000L)
+        val duplicate = tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 4_000L)
+        assertEquals(1, first.stableFrameCount)
+        assertEquals(1, duplicate.stableFrameCount)
+        assertTrue(duplicate.decision.contains("timestamp ignored"))
+        assertNull(duplicate.killEvent)
+
+        assertNull(tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 5_000L).killEvent)
+        val confirmed = tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 6_000L)
+        assertEquals(HighlightEventType.KILL, confirmed.killEvent?.type)
+    }
+
+    @Test
+    fun uniqueValidatedReadingCanRelockAfterHudMovesWithoutIconText() {
+        val tracker = MyKdaTracker()
+        repeat(3) { tracker.observe(listOf(candidate(0, 0, 0, x = 0.2f)), 1_000L + it * 1_000L) }
+        val firstMovedFrame = tracker.observe(listOf(candidate(1, 0, 0, x = 0.8f)), 4_000L)
+        assertEquals(1, firstMovedFrame.stableFrameCount)
+        assertEquals("1/0/0", firstMovedFrame.selectedCandidate?.rawText)
+        assertNull(firstMovedFrame.killEvent)
+
+        tracker.observe(listOf(candidate(1, 0, 0, x = 0.8f)), 5_000L)
+        val confirmed = tracker.observe(listOf(candidate(1, 0, 0, x = 0.8f)), 6_000L)
+        assertEquals(HighlightEventType.KILL, confirmed.killEvent?.type)
+    }
+
+    @Test
+    fun lowConfidenceStableKdaUpdatesLiveStateButKillNeedsReview() {
         val tracker = MyKdaTracker()
         repeat(3) { tracker.observe(listOf(candidate(5, 2, 3)), sourceTimeMs = 1_000L + it * 1_000L) }
         val uncertain = (4..6).map { sample ->
@@ -222,7 +271,8 @@ class MyKdaTrackerTest {
 
         assertNull(uncertain.killEvent)
         assertEquals("Kill increase needs review: OCR confidence too low", uncertain.decision)
-        assertEquals(KdaSnapshot(5, 2, 3), uncertain.current)
+        assertEquals(KdaSnapshot(6, 2, 3), uncertain.current)
+        assertEquals(5, uncertain.lastConfirmedK)
 
         val confirmed = (7..9).mapNotNull { sample ->
             tracker.observe(
@@ -247,21 +297,21 @@ class MyKdaTrackerTest {
         val k1 = (4..6).mapNotNull {
             tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 1_000L * it).killEvent
         }.single()
-        assertEquals(4_000L, k1.sourceTimeMs)
+        assertEquals(3_500L, k1.sourceTimeMs)
         assertEquals(1, tracker.current?.kills)
 
         // Kill 2 (1 -> 2)
         val k2 = (7..9).mapNotNull {
             tracker.observe(listOf(candidate(2, 0, 1)), sourceTimeMs = 1_000L * it).killEvent
         }.single()
-        assertEquals(7_000L, k2.sourceTimeMs)
+        assertEquals(6_500L, k2.sourceTimeMs)
         assertEquals(2, tracker.current?.kills)
 
         // Kill 3 (2 -> 3)
         val k3 = (10..12).mapNotNull {
             tracker.observe(listOf(candidate(3, 1, 1)), sourceTimeMs = 1_000L * it).killEvent
         }.single()
-        assertEquals(10_000L, k3.sourceTimeMs)
+        assertEquals(9_500L, k3.sourceTimeMs)
         assertEquals(3, tracker.current?.kills)
     }
 
@@ -308,6 +358,40 @@ class MyKdaTrackerTest {
             HighlightEventType.KILL,
             tracker.observe(listOf(candidate(1, 0, 0)), sourceTimeMs = 9_000L).killEvent?.type
         )
+    }
+
+    @Test
+    fun stableFullKdaRegressionStartsNewSessionAndAllowsNewKills() {
+        val tracker = MyKdaTracker()
+        repeat(3) { tracker.observe(listOf(candidate(8, 4, 11)), 1_000L + it * 1_000L) }
+
+        val reset = (4..6).map { tracker.observe(listOf(candidate(0, 0, 0)), it * 1_000L) }
+        assertTrue(reset.take(2).all { it.killEvent == null })
+        assertTrue(reset.last().decision.contains("new match/session baseline"))
+        assertEquals(KdaSnapshot(0, 0, 0), tracker.baseline)
+        assertEquals(0, tracker.lastConfirmedKills)
+
+        val firstKill = (7..9).mapNotNull {
+            tracker.observe(listOf(candidate(1, 0, 0)), it * 1_000L).killEvent
+        }.single()
+        assertEquals(1, firstKill.killsAdded)
+        assertEquals(0, firstKill.previousKillCount)
+        assertEquals(1, firstKill.currentKillCount)
+    }
+
+    @Test
+    fun staleTimestampCannotOverwriteNewerLiveKdaOrEmitAnEvent() {
+        val tracker = MyKdaTracker()
+        repeat(3) { tracker.observe(listOf(candidate(2, 0, 1)), 1_000L + it * 1_000L) }
+        tracker.observe(listOf(candidate(3, 0, 1)), 4_000L)
+        tracker.observe(listOf(candidate(3, 0, 1)), 5_000L)
+        val newest = tracker.observe(listOf(candidate(3, 0, 1)), 6_000L)
+        val stale = tracker.observe(listOf(candidate(9, 0, 1)), 5_500L)
+
+        assertEquals(HighlightEventType.KILL, newest.killEvent?.type)
+        assertTrue(stale.decision.contains("timestamp ignored"))
+        assertEquals(KdaSnapshot(3, 0, 1), stale.current)
+        assertNull(stale.killEvent)
     }
 
     @Test

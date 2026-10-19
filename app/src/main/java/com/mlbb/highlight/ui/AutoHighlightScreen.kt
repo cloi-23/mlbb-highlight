@@ -5,10 +5,12 @@ import android.graphics.Rect
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -36,12 +39,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -60,12 +65,14 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.mlbb.highlight.detection.KdaNumberToken
 import com.mlbb.highlight.detection.KdaReading
 import com.mlbb.highlight.detection.KdaSpatialParser
+import com.mlbb.highlight.detection.OcrDetector
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import com.mlbb.highlight.highlight.EffectIntensity
+import com.mlbb.highlight.highlight.EffectPreset
 import com.mlbb.highlight.highlight.HighlightAspectRatio
 import com.mlbb.highlight.highlight.HighlightClip
 import com.mlbb.highlight.highlight.HighlightEvent
@@ -77,18 +84,24 @@ import com.mlbb.highlight.highlight.AutoHighlightEngine
 import com.mlbb.highlight.highlight.TextOverlay
 import com.mlbb.highlight.highlight.TextPosition
 import com.mlbb.highlight.highlight.buildHighlightSpeedProvider
+import com.mlbb.highlight.highlight.withEventTimingOffset
 import com.mlbb.highlight.detection.HudRegion
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
+import kotlinx.coroutines.launch
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 fun AutoHighlightScreen(
     videoUri: String?,
     trimStartMs: Long,
     trimEndMs: Long,
+    sourceDurationMs: Long,
+    onTrimChanged: (Long, Long) -> Unit,
     timeline: HighlightTimeline?,
     detectedEvents: List<HighlightEvent>,
     scanResult: AutoHighlightEngine.HighlightScanResult?,
+    scanProgress: AutoHighlightEngine.KdaScanProgress?,
     hudRegion: HudRegion,
     isAnalyzing: Boolean,
     analysisMessage: String?,
@@ -102,12 +115,15 @@ fun AutoHighlightScreen(
     onAcceptReview: (AutoHighlightEngine.HighlightReview) -> Unit,
     onDismissReview: (String) -> Unit,
     onClipChanged: (HighlightClip) -> Unit,
+    onApplyEffectToAll: (EffectPreset) -> Unit,
     onClipRemoved: (HighlightClip) -> Unit,
     onStyleChanged: (HighlightStyle) -> Unit,
     onAspectRatioChanged: (HighlightAspectRatio) -> Unit,
     onResolutionChanged: (HighlightResolution) -> Unit,
     onChooseMusic: () -> Unit,
     onMusicVolumeChanged: (Float) -> Unit,
+    onKillSoundEnabledChanged: (Boolean) -> Unit,
+    onKillSoundVolumeChanged: (Float) -> Unit,
     onPreview: () -> Unit,
     onExport: () -> Unit,
     onBack: () -> Unit
@@ -156,16 +172,24 @@ fun AutoHighlightScreen(
     val selectedPreviewStartMs = selectedClip?.let { trimStartMs + it.startMs } ?: trimStartMs
     val selectedPreviewEndMs = selectedClip?.let { trimStartMs + it.endMs } ?: trimEndMs
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        EditorScreenHeader(
-            title = "Auto Highlight",
-            onBack = onBack
-        )
-        Text(
-            "Analyze your video to build an editable montage. Automatic moments need a stable, high-confidence kill-counter increase; uncertain moments stay here for review. Manual marking and clip editing remain available.",
-            color = RecorderTheme.textSecondary
-        )
+    var activeStep by rememberSaveable { mutableStateOf("Video") }
+    val steps = listOf("Video", "Highlights", "Effects", "Music", "Export")
+    val previewStart = when {
+        activeStep == "Video" -> 0L
+        activeStep == "Effects" && selectedClip != null -> trimStartMs + selectedClip.startMs
+        else -> trimStartMs
+    }
+    val previewEnd = when {
+        activeStep == "Video" -> sourceDurationMs.coerceAtLeast(trimEndMs)
+        activeStep == "Effects" && selectedClip != null -> trimStartMs + selectedClip.endMs
+        else -> trimEndMs
+    }
 
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        EditorScreenHeader(title = "Auto Highlight", onBack = onBack)
         if (videoUri == null) {
             EmptyEditorCard(
                 title = "Choose a gameplay video",
@@ -174,260 +198,251 @@ fun AutoHighlightScreen(
                 onClick = onBack
             )
         } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                steps.forEach { step ->
+                    FilterChip(
+                        selected = activeStep == step,
+                        onClick = { activeStep = step },
+                        label = { Text(step) }
+                    )
+                }
+                OutlinedButton(onClick = { activeStep = "Advanced" }) {
+                    Text("Advanced")
+                }
+            }
             VideoPreview(
                 videoUri = videoUri,
-                startMs = selectedPreviewStartMs,
-                endMs = selectedPreviewEndMs,
+                startMs = previewStart,
+                endMs = previewEnd,
                 onDurationChanged = {},
                 videoEffects = previewPipeline.videoEffects,
                 speedProvider = previewSpeedProvider,
-                previewSeekMs = selectedClip?.let { trimStartMs + it.eventTimeMs } ?: trimStartMs,
-                onPositionChanged = { playheadMs = it }
+                previewSeekMs = if (activeStep == "Video") trimStartMs
+                    else selectedClip?.let { trimStartMs + it.eventTimeMs } ?: trimStartMs,
+                onPositionChanged = { playheadMs = it },
+                previewMaxHeight = 280.dp
             )
 
-            Text("Choose a style", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                HighlightStyle.entries.forEach { option ->
-                    FilterChip(
-                        selected = style == option,
-                        onClick = {
-                            style = option
-                            onStyleChanged(option)
-                        },
-                        label = { Text(option.label) }
+            when (activeStep) {
+                "Video" -> {
+                    Text("Trim video", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                    VideoTimeline(
+                        context = androidx.compose.ui.platform.LocalContext.current,
+                        videoUri = videoUri,
+                        sourceStartMs = 0L,
+                        durationMs = sourceDurationMs.coerceAtLeast(trimEndMs),
+                        startMs = trimStartMs,
+                        endMs = trimEndMs,
+                        onTrimChanged = onTrimChanged,
+                        playheadMs = playheadMs.coerceIn(trimStartMs, trimEndMs)
                     )
-                }
-            }
-
-            HudCalibrationCard(
-                videoUri = videoUri,
-                currentPlayheadMs = playheadMs,
-                region = hudRegion,
-                onRegionChanged = onHudRegionChanged
-            )
-
-            Button(
-                onClick = { onAnalyze(style) },
-                enabled = !isAnalyzing && !isExporting,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                androidx.compose.material3.Icon(
-                    imageVector = Icons.Outlined.AutoAwesome,
-                    contentDescription = null
-                )
-                Text(if (isAnalyzing) "Analyzing gameplay…" else "Auto Highlight")
-            }
-            if (isAnalyzing) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-            }
-            analysisMessage?.let { Text(it, color = RecorderTheme.cyan) }
-            KdaTrackerDiagnostics(scanResult)
-            scanResult?.reviewDetections?.forEach { review ->
-                ReviewDetectionCard(
-                    review = review,
-                    onAccept = { onAcceptReview(review) },
-                    onDismiss = { onDismissReview(review.id) }
-                )
-            }
-            OutlinedButton(
-                onClick = { showDetectionDebug = !showDetectionDebug },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (showDetectionDebug) "Hide detection details" else "Show detection details")
-            }
-            if (showDetectionDebug) {
-                KdaDetectionDebug(scanResult)
-            }
-
-            Text("Moment timeline", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-            VideoTimeline(
-                context = androidx.compose.ui.platform.LocalContext.current,
-                videoUri = videoUri,
-                sourceStartMs = trimStartMs,
-                durationMs = trimDurationMs,
-                startMs = 0L,
-                endMs = trimDurationMs,
-                onTrimChanged = { _, _ -> },
-                markerTimesMs = detectedEvents.map { it.sourceTimeMs - trimStartMs },
-                playheadMs = (playheadMs - trimStartMs).coerceIn(0L, trimDurationMs)
-            )
-            Text(
-                if (detectedEvents.isEmpty()) {
-                    "No personal kill increase detected yet. Play to a moment and mark it manually."
-                } else {
-                    "${detectedEvents.count { it.origin == HighlightEventOrigin.OCR }} OCR moments · " +
-                        "${detectedEvents.count { it.origin == HighlightEventOrigin.MANUAL }} manual marks"
-                },
-                color = RecorderTheme.textSecondary,
-                style = MaterialTheme.typography.bodySmall
-            )
-            OutlinedButton(
-                onClick = { onManualMark(playheadMs.coerceIn(trimStartMs, trimEndMs)) },
-                enabled = !isAnalyzing && !isExporting,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Mark Moment at ${formatEditorTime(playheadMs)}")
-            }
-
-            if (timeline != null && timeline.sourceUri == videoUri && timeline.clips.isNotEmpty()) {
-                Text(
-                    "Generated moments · ${formatEditorTime(timeline.durationMs)} total",
-                    color = RecorderTheme.textPrimary,
-                    fontWeight = FontWeight.SemiBold
-                )
-                timeline.clips.forEach { clip ->
-                    val isSelected = clip.id == selectedClipId
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(16.dp))
-                            .clickable { selectedClipId = clip.id },
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (isSelected) {
-                                Color(0xFF163A66)
-                            } else {
-                                RecorderTheme.surface
-                            }
-                        )
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
-                            Text(
-                                clip.label,
-                                color = RecorderTheme.textPrimary,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                "${formatEditorTime(clip.startMs)} – ${formatEditorTime(clip.endMs)}  ·  " +
-                                    clip.effectPreset.name,
-                                color = RecorderTheme.textSecondary,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                            clip.events.firstOrNull()?.let { event ->
-                                Text(
-                                    if (event.origin == HighlightEventOrigin.OCR) {
-                                        "OCR · ${(event.confidence * 100f).roundToInt()}% confidence"
-                                    } else {
-                                        "Manually marked"
-                                    },
-                                    color = RecorderTheme.cyan,
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                            }
-                        }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Start · ${formatEditorTime(trimStartMs)}", color = RecorderTheme.textSecondary)
+                        Text("End · ${formatEditorTime(trimEndMs)}", color = RecorderTheme.textSecondary)
                     }
-                }
-                if (selectedClip != null) {
-                    ClipEditor(
-                        clip = selectedClip,
-                        maxDurationMs = trimDurationMs,
-                        advanced = showAdvanced,
-                        onAdvancedChanged = { showAdvanced = it },
-                        onClipChanged = onClipChanged,
-                        onClipRemoved = {
-                            onClipRemoved(selectedClip)
-                            selectedClipId = timeline.clips.firstOrNull { it.id != selectedClip.id }?.id.orEmpty()
-                        }
-                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(
-                            onClick = onPreview,
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = !isAnalyzing && !isExporting
-                        ) {
-                            Text("Preview full montage")
-                        }
-                    }
-                }
-
-                Text("Output aspect ratio", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    HighlightAspectRatio.entries.forEach { ratio ->
-                        FilterChip(
-                            selected = timeline.aspectRatio == ratio,
-                            onClick = { onAspectRatioChanged(ratio) },
-                            label = { Text(ratio.label) }
-                        )
-                    }
-                }
-                Text("Export size", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    HighlightResolution.entries.forEach { resolution ->
-                        FilterChip(
-                            selected = timeline.resolution == resolution,
-                            onClick = { onResolutionChanged(resolution) },
-                            label = { Text(resolution.label) }
-                        )
-                    }
-                }
-
-                Card(
-                    colors = CardDefaults.cardColors(containerColor = RecorderTheme.surface),
-                    shape = RoundedCornerShape(16.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Music", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            if (timeline.musicUri == null) {
-                                "Original game audio is kept. Import a music track to mix it into the export."
-                            } else {
-                                "Custom background track selected"
+                            onClick = {
+                                val safeStart = playheadMs.coerceIn(0L, (trimEndMs - 100L).coerceAtLeast(0L))
+                                onTrimChanged(safeStart, trimEndMs)
                             },
-                            color = RecorderTheme.textSecondary,
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        OutlinedButton(onClick = onChooseMusic, modifier = Modifier.fillMaxWidth()) {
-                            Text(if (timeline.musicUri == null) "Choose Music File" else "Change Music File")
+                            enabled = playheadMs < trimEndMs - 100L,
+                            modifier = Modifier.weight(1f).height(48.dp)
+                        ) { Text("Set start") }
+                        OutlinedButton(
+                            onClick = {
+                                val safeEnd = playheadMs.coerceIn(trimStartMs + 100L, sourceDurationMs.coerceAtLeast(trimStartMs + 100L))
+                                onTrimChanged(trimStartMs, safeEnd)
+                            },
+                            enabled = playheadMs > trimStartMs + 100L,
+                            modifier = Modifier.weight(1f).height(48.dp)
+                        ) { Text("Set end") }
+                    }
+                    Text(
+                        "Choose the match range first. Playback controls are directly below the preview.",
+                        color = RecorderTheme.textSecondary,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                "Highlights" -> {
+                    Text("Find and review moments", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        HighlightStyle.entries.forEach { option ->
+                            FilterChip(selected = style == option, onClick = {
+                                style = option
+                                onStyleChanged(option)
+                            }, label = { Text(option.label) })
                         }
-                        if (timeline.musicUri != null) {
-                            Text(
-                                "Music volume · ${(timeline.musicVolume * 100f).roundToInt()}%",
-                                color = RecorderTheme.textSecondary
+                    }
+                    Button(
+                        onClick = { onAnalyze(style) },
+                        enabled = !isAnalyzing && !isExporting,
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        androidx.compose.material3.Icon(Icons.Outlined.AutoAwesome, contentDescription = null)
+                        Text(if (isAnalyzing) "Scanning gameplay…" else "Scan for highlights")
+                    }
+                    if (isAnalyzing) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    analysisMessage?.let { Text(it, color = RecorderTheme.cyan) }
+                    scanResult?.reviewDetections?.forEach { review ->
+                        ReviewDetectionCard(review = review, onAccept = { onAcceptReview(review) },
+                            onDismiss = { onDismissReview(review.id) })
+                    }
+                    VideoTimeline(
+                        context = androidx.compose.ui.platform.LocalContext.current,
+                        videoUri = videoUri,
+                        sourceStartMs = trimStartMs,
+                        durationMs = trimDurationMs,
+                        startMs = 0L,
+                        endMs = trimDurationMs,
+                        onTrimChanged = { _, _ -> },
+                        markerTimesMs = detectedEvents.map { it.sourceTimeMs - trimStartMs },
+                        playheadMs = (playheadMs - trimStartMs).coerceIn(0L, trimDurationMs)
+                    )
+                    Text(
+                        if (detectedEvents.isEmpty()) "No personal kill increase detected yet. Play to a moment and mark it manually."
+                        else "${detectedEvents.count { it.origin == HighlightEventOrigin.OCR }} OCR moments · ${detectedEvents.count { it.origin == HighlightEventOrigin.MANUAL }} manual marks",
+                        color = RecorderTheme.textSecondary,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedButton(
+                        onClick = { onManualMark(playheadMs.coerceIn(trimStartMs, trimEndMs)) },
+                        enabled = !isAnalyzing && !isExporting,
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) { Text("Add moment at ${formatEditorTime(playheadMs)}") }
+                }
+                "Effects" -> {
+                    Text("Choose a moment to edit", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                    if (timeline?.clips?.isNotEmpty() == true && timeline.sourceUri == videoUri) {
+                        Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            timeline.clips.forEach { clip ->
+                                FilterChip(selected = clip.id == selectedClipId,
+                                    onClick = { selectedClipId = clip.id },
+                                    label = { Text("${clip.label} · ${formatEditorTime(clip.eventTimeMs)}") })
+                            }
+                        }
+                        if (selectedClip != null) {
+                            ClipEditor(
+                                clip = selectedClip,
+                                maxDurationMs = trimDurationMs,
+                                advanced = showAdvanced,
+                                onAdvancedChanged = { showAdvanced = it },
+                                onClipChanged = onClipChanged,
+                                onApplyEffectToAll = onApplyEffectToAll,
+                                onClipRemoved = {
+                                    onClipRemoved(selectedClip)
+                                    selectedClipId = timeline.clips.firstOrNull { it.id != selectedClip.id }?.id.orEmpty()
+                                }
                             )
-                            Slider(
-                                value = timeline.musicVolume,
-                                onValueChange = onMusicVolumeChanged,
-                                valueRange = 0f..1f
-                            )
+                            Text("Current effect · ${selectedClip.effectPreset.name}", color = RecorderTheme.cyan)
+                        }
+                    } else {
+                        Text("Scan for highlights or add a moment manually before editing effects.",
+                            color = RecorderTheme.textSecondary)
+                    }
+                }
+                "Music" -> {
+                    val currentTimeline = effectiveTimeline
+                    if (currentTimeline == null) {
+                        Text("Add a highlight moment before setting montage audio.", color = RecorderTheme.textSecondary)
+                    } else {
+                        Text("Music and moment sound", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (currentTimeline.musicUri == null) "Game audio stays on. Add your own soundtrack if you want background music."
+                            else "Custom soundtrack selected · game audio stays on.",
+                            color = RecorderTheme.textSecondary
+                        )
+                        OutlinedButton(onClick = onChooseMusic, modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                            Text(if (currentTimeline.musicUri == null) "Choose music" else "Change music")
+                        }
+                        if (currentTimeline.musicUri != null) {
+                            Text("Music volume · ${(currentTimeline.musicVolume * 100f).roundToInt()}%", color = RecorderTheme.textSecondary)
+                            Slider(value = currentTimeline.musicVolume, onValueChange = onMusicVolumeChanged, valueRange = 0f..1f)
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Kill sound", modifier = Modifier.weight(1f), color = RecorderTheme.textPrimary)
+                            androidx.compose.material3.Switch(checked = currentTimeline.enableKillSound,
+                                onCheckedChange = onKillSoundEnabledChanged)
+                        }
+                        if (currentTimeline.enableKillSound) {
+                            Text("Kill sound volume · ${(currentTimeline.killSoundVolume * 100f).roundToInt()}%", color = RecorderTheme.textSecondary)
+                            Slider(value = currentTimeline.killSoundVolume, onValueChange = onKillSoundVolumeChanged, valueRange = 0f..1f)
                         }
                     }
                 }
-            } else if (timeline != null && timeline.sourceUri == videoUri) {
-                Text(
-                    "No event was confidently recognized. Nothing has been invented—mark a moment manually above.",
-                    color = RecorderTheme.textSecondary
-                )
-            }
-        }
-
-        if (isExporting) {
-            LinearProgressIndicator(
-                progress = { exportProgress.coerceIn(0f, 1f) },
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        exportMessage?.let { Text(it, color = RecorderTheme.textSecondary) }
-        if (timeline?.clips?.isNotEmpty() == true) {
-            Button(
-                onClick = onExport,
-                enabled = isPreviewReady && !isExporting && !isAnalyzing,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    when {
-                        isExporting -> "Exporting…"
-                        isPreviewReady -> "Export Highlight MP4"
-                        else -> "Preview before Export"
+                "Export" -> {
+                    val currentTimeline = effectiveTimeline
+                    if (currentTimeline == null || currentTimeline.clips.isEmpty()) {
+                        Text("Create or mark highlights before exporting.", color = RecorderTheme.textSecondary)
+                    } else {
+                        Text("Review montage", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                        currentTimeline.clips.lastOrNull()?.let { last ->
+                            Text("Final moment · ${last.label} · ${formatEditorTime(last.durationMs)}",
+                                color = RecorderTheme.cyan)
+                        }
+                        OutlinedButton(onClick = onPreview, modifier = Modifier.fillMaxWidth().height(48.dp),
+                            enabled = !isAnalyzing && !isExporting) { Text("Preview full montage") }
+                        Text("Output ratio", color = RecorderTheme.textPrimary)
+                        Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            HighlightAspectRatio.entries.forEach { ratio ->
+                                FilterChip(selected = currentTimeline.aspectRatio == ratio,
+                                    onClick = { onAspectRatioChanged(ratio) }, label = { Text(ratio.label) })
+                            }
+                        }
+                        Text("Resolution", color = RecorderTheme.textPrimary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            HighlightResolution.entries.forEach { resolution ->
+                                FilterChip(selected = currentTimeline.resolution == resolution,
+                                    onClick = { onResolutionChanged(resolution) }, label = { Text(resolution.label) })
+                            }
+                        }
+                        Button(onClick = onExport, enabled = isPreviewReady && !isExporting && !isAnalyzing,
+                            modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                            Text(when { isExporting -> "Exporting…"; isPreviewReady -> "Export highlight MP4"; else -> "Preview before export" })
+                        }
                     }
-                )
+                }
+                else -> {
+                    Text("Advanced Settings", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                    Text("Adjust the HUD only if automatic detection is missing or misreading your kill counter.",
+                        color = RecorderTheme.textSecondary)
+                    HudCalibrationCard(videoUri = videoUri, currentPlayheadMs = playheadMs,
+                        region = hudRegion, onRegionChanged = onHudRegionChanged)
+                    KdaTrackerDiagnostics(videoUri = videoUri, trimStartMs = trimStartMs,
+                        trimEndMs = trimEndMs, scanResult = scanResult, scanProgress = scanProgress,
+                        isAnalyzing = isAnalyzing)
+                    OutlinedButton(onClick = { showDetectionDebug = !showDetectionDebug },
+                        modifier = Modifier.fillMaxWidth()) {
+                        Text(if (showDetectionDebug) "Hide detection details" else "Show detection details")
+                    }
+                    if (showDetectionDebug) KdaDetectionDebug(scanResult)
+                    if (selectedClip != null) {
+                        Text("Effect timing · ${formatSignedSeconds(selectedClip.eventTimeMs - selectedClip.detectedEventTimeMs)} from detected point",
+                            color = RecorderTheme.textSecondary)
+                        Slider(
+                            value = ((selectedClip.eventTimeMs - selectedClip.detectedEventTimeMs) / 1_000f).coerceIn(-2f, 2f),
+                            onValueChange = { seconds -> onClipChanged(selectedClip.withEventTimingOffset((seconds * 1_000f).roundToLong())) },
+                            valueRange = -2f..2f,
+                            steps = 15
+                        )
+                    }
+                    Text("Detection confidence rules are fixed in the detector; configurable thresholds are not currently available.",
+                        color = RecorderTheme.textSecondary, style = MaterialTheme.typography.bodySmall)
+                }
             }
         }
+        if (isExporting) LinearProgressIndicator(progress = { exportProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+        exportMessage?.let { Text(it, color = RecorderTheme.textSecondary) }
     }
+}
+
+private fun formatSignedSeconds(milliseconds: Long): String {
+    val seconds = milliseconds / 1_000f
+    return "${if (seconds > 0f) "+" else ""}${"%.2f".format(seconds)}s"
 }
 
 @Composable
@@ -478,6 +493,9 @@ private fun HudCalibrationCard(
 
     var ocrStatus by remember { mutableStateOf("Adjust crop to cover your ⚔ ☠ 🤝 K/D/A") }
     var detectedKda by remember { mutableStateOf<KdaReading?>(null) }
+    var verificationRequest by remember(videoUri) { mutableIntStateOf(0) }
+    var verificationStatus by remember(videoUri) { mutableStateOf<String?>(null) }
+    var isVerifying by remember(videoUri) { mutableStateOf(false) }
     LaunchedEffect(croppedBitmap) {
         val crop = croppedBitmap ?: return@LaunchedEffect
         ocrStatus = "Reading HUD text…"
@@ -506,10 +524,13 @@ private fun HudCalibrationCard(
                 val parsed = KdaSpatialParser.parseDetailed(tokens, crop.width, crop.height)
                 val firstReading = parsed.readings.firstOrNull()
                 withContext(Dispatchers.Main) {
-                    detectedKda = firstReading
-                    ocrStatus = if (firstReading != null) {
+                    detectedKda = firstReading?.takeIf { it.isTripletNumericallyValid }
+                    ocrStatus = if (firstReading?.isTripletNumericallyValid == true) {
                         "✓ Found K/D/A: ${firstReading.kills} / ${firstReading.deaths} / ${firstReading.assists} " +
                             "(${(firstReading.confidence * 100f).roundToInt()}% confidence)"
+                    } else if (firstReading != null) {
+                        "OCR found a row, but one or more K/D/A values were not numeric. " +
+                            "Choose a clearer frame or adjust the HUD crop."
                     } else {
                         val rawText = visionText.text.replace("\n", " ").trim()
                         if (rawText.isNotEmpty()) {
@@ -525,6 +546,25 @@ private fun HudCalibrationCard(
                 }
             }
         }
+    }
+    LaunchedEffect(verificationRequest, videoUri) {
+        if (verificationRequest == 0 || videoUri == null) return@LaunchedEffect
+        isVerifying = true
+        verificationStatus = null
+        val result = withContext(Dispatchers.IO) {
+            autoDetectHudAcrossFrames(context, videoUri, calibrationTimeMs)
+        }
+        isVerifying = false
+        verificationStatus = result?.let { summary ->
+            if (summary.readableFrames >= 2 && summary.positionConsistent && summary.region != null) {
+                onRegionChanged(summary.region)
+                "HUD found and crop positioned automatically (${summary.readableFrames}/${summary.sampledFrames} frames, " +
+                    "${(summary.meanOcrConfidence * 100f).roundToInt()}% mean OCR confidence)."
+            } else {
+                "HUD not stable enough to lock (${summary.readableFrames}/${summary.sampledFrames} frames). " +
+                    "Choose a clearer section and try again."
+            }
+        } ?: "Could not scan the video. Try another frame."
     }
 
     Card(
@@ -646,6 +686,17 @@ private fun HudCalibrationCard(
                 }
             }
 
+            OutlinedButton(
+                onClick = { verificationRequest += 1 },
+                enabled = videoUri != null && !isVerifying,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (isVerifying) "Finding K/D/A in video…" else "Auto-detect HUD")
+            }
+            verificationStatus?.let { status ->
+                Text(status, color = RecorderTheme.textSecondary, style = MaterialTheme.typography.bodySmall)
+            }
+
             // Presets
             Text("Calibration presets", color = RecorderTheme.textSecondary, style = MaterialTheme.typography.labelMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -678,6 +729,117 @@ private fun HudCalibrationCard(
             }
         }
     }
+}
+
+private data class HudVerificationSummary(
+    val sampledFrames: Int,
+    val readableFrames: Int,
+    val meanOcrConfidence: Float,
+    val positionConsistent: Boolean,
+    val region: HudRegion?
+)
+
+private suspend fun autoDetectHudAcrossFrames(
+    context: android.content.Context,
+    videoUri: String,
+    centerTimeMs: Long
+): HudVerificationSummary? {
+    val retriever = MediaMetadataRetriever()
+    val detector = OcrDetector(HudRegion.DEFAULT)
+    data class FrameReading(val reading: KdaReading, val width: Int, val height: Int)
+    val readings = mutableListOf<FrameReading>()
+    var sampledFrames = 0
+    try {
+        retriever.setDataSource(context, Uri.parse(videoUri))
+        val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            ?.toLongOrNull() ?: return null
+        if (durationMs <= 0L) return null
+        val sampleTimes = listOf(-300L, 0L, 300L)
+            .map { (centerTimeMs + it).coerceIn(0L, durationMs - 1L) }
+            .distinct()
+        for (sampleTimeMs in sampleTimes) {
+            val frame = retriever.getScaledFrameAtTime(
+                sampleTimeMs * 1_000L,
+                MediaMetadataRetriever.OPTION_CLOSEST,
+                1280,
+                720
+            ) ?: continue
+            sampledFrames += 1
+            try {
+                val candidate = detector.analyze(frame, sampleTimeMs).kdaCandidates
+                    .filter { reading ->
+                        reading.isTripletNumericallyValid &&
+                            reading.confidence >= 0.45f &&
+                            reading.bounds.centerX() > frame.width * 0.50f &&
+                            reading.bounds.top < frame.height * 0.75f
+                    }
+                    .minByOrNull { reading ->
+                        val centerX = reading.bounds.centerX().toFloat() / frame.width
+                        // Prefer the right-side HUD even when the gameplay
+                        // viewport is vertically letterboxed in a portrait file.
+                        kotlin.math.abs(centerX - 0.83f)
+                    }
+                if (candidate != null) {
+                    readings += FrameReading(candidate, frame.width, frame.height)
+                }
+            } finally {
+                frame.recycle()
+            }
+        }
+    } catch (_: Exception) {
+        return null
+    } finally {
+        detector.close()
+        retriever.release()
+    }
+    if (sampledFrames == 0) return null
+    val positions = readings.map { frameReading ->
+        val reading = frameReading.reading
+        (reading.bounds.centerX().toFloat() / frameReading.width) to
+            (reading.bounds.centerY().toFloat() / frameReading.height)
+    }
+    val meanX = positions.map { it.first }.average().toFloat().takeIf { it.isFinite() } ?: 0f
+    val meanY = positions.map { it.second }.average().toFloat().takeIf { it.isFinite() } ?: 0f
+    val positionConsistent = positions.isNotEmpty() && positions.all { position ->
+        kotlin.math.hypot(position.first - meanX, position.second - meanY) <= 0.07f
+    }
+    val meanConfidence = readings.map { it.reading.confidence }
+        .average().toFloat().takeIf { it.isFinite() } ?: 0f
+    val normalizedBounds = readings.map { frameReading ->
+        val bounds = frameReading.reading.bounds
+        listOf(
+            bounds.left.toFloat() / frameReading.width,
+            bounds.top.toFloat() / frameReading.height,
+            bounds.right.toFloat() / frameReading.width,
+            bounds.bottom.toFloat() / frameReading.height
+        )
+    }
+    fun median(values: List<Float>): Float = values.sorted().let { sorted ->
+        sorted[sorted.size / 2]
+    }
+    val detectedRegion = if (readings.isNotEmpty() && positionConsistent) {
+        HudRegion(
+            left = (median(normalizedBounds.map { it[0] }) - 0.035f).coerceIn(0f, 0.97f),
+            top = (median(normalizedBounds.map { it[1] }) - 0.02f).coerceIn(0f, 0.97f),
+            right = (median(normalizedBounds.map { it[2] }) + 0.035f).coerceIn(0.03f, 1f),
+            bottom = (median(normalizedBounds.map { it[3] }) + 0.04f).coerceIn(0.03f, 1f)
+        ).let { candidate ->
+            // Keep the crop valid when OCR returns a very tight glyph box.
+            candidate.copy(
+                right = maxOf(candidate.right, (candidate.left + HudRegion.MIN_REGION_SIZE).coerceAtMost(1f)),
+                bottom = maxOf(candidate.bottom, (candidate.top + HudRegion.MIN_REGION_SIZE).coerceAtMost(1f))
+            )
+        }
+    } else {
+        null
+    }
+    return HudVerificationSummary(
+        sampledFrames = sampledFrames,
+        readableFrames = readings.size,
+        meanOcrConfidence = meanConfidence,
+        positionConsistent = positionConsistent,
+        region = detectedRegion
+    )
 }
 
 private suspend fun <T> Task<T>.await(): T =
@@ -764,8 +926,8 @@ private fun KdaDetectionDebug(scanResult: AutoHighlightEngine.HighlightScanResul
             }
             observations.forEach { observation ->
                 Text(
-                    "Timestamp: ${observation.requestedTimeMs} ms · Kill Confirmed: ${if (observation.isKillConfirmed) "YES ✓" else "NO"}",
-                    color = if (observation.isKillConfirmed) RecorderTheme.cyan else RecorderTheme.textPrimary,
+                    "Frame: ${observation.requestedTimeMs} ms · Counter increase confirmed: ${if (observation.counterIncreaseConfirmed) "YES ✓" else "NO"}",
+                    color = if (observation.counterIncreaseConfirmed) RecorderTheme.cyan else RecorderTheme.textPrimary,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
@@ -801,9 +963,12 @@ private fun KdaDetectionDebug(scanResult: AutoHighlightEngine.HighlightScanResul
                         color = RecorderTheme.cyan
                     )
                 }
-                observation.selectedEventTimestampMs?.let { timestamp ->
+                observation.counterIncrease?.let { increase ->
                     Text(
-                        "Selected event timestamp: ${timestamp} ms",
+                        "Counter ${increase.previousKills} → ${increase.currentKills} " +
+                            "(+${increase.killsAdded}); first seen ${increase.firstObservedAtMs} ms, " +
+                            "confirmed ${increase.confirmedAtMs} ms; previous value last seen " +
+                            "${increase.previousObservedAtMs ?: "unknown"} ms",
                         color = RecorderTheme.cyan
                     )
                 }
@@ -814,7 +979,12 @@ private fun KdaDetectionDebug(scanResult: AutoHighlightEngine.HighlightScanResul
 
 @Composable
 private fun KdaTrackerDiagnostics(
-    scanResult: AutoHighlightEngine.HighlightScanResult?
+    videoUri: String,
+    trimStartMs: Long,
+    trimEndMs: Long,
+    scanResult: AutoHighlightEngine.HighlightScanResult?,
+    scanProgress: AutoHighlightEngine.KdaScanProgress?,
+    isAnalyzing: Boolean
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = RecorderTheme.surface),
@@ -829,20 +999,89 @@ private fun KdaTrackerDiagnostics(
                 color = RecorderTheme.textPrimary,
                 fontWeight = FontWeight.SemiBold
             )
+            if (isAnalyzing && scanProgress != null) {
+                Text(
+                    "Scanning sample ${scanProgress.sampleIndex} / ${scanProgress.sampleCount} · " +
+                        formatEditorTime(scanProgress.sourceTimeMs),
+                    color = RecorderTheme.cyan,
+                    fontWeight = FontWeight.Medium
+                )
+                VideoPreview(
+                    videoUri = videoUri,
+                    startMs = trimStartMs,
+                    endMs = trimEndMs,
+                    onDurationChanged = {},
+                    previewSeekMs = scanProgress.sourceTimeMs,
+                    previewRequestId = scanProgress.sampleIndex,
+                    autoPlay = false,
+                    showPlaybackControls = false
+                )
+            }
             val baseline = scanResult?.baselineKda
             val current = scanResult?.finalKda
+            val liveKda = scanProgress?.currentKda
+            val observedKdaStatus = if (scanProgress?.observedKda == liveKda) "confirmed" else "verifying"
+            val latestHudKills = scanProgress?.observedKda?.kills ?: liveKda?.kills
+            val pendingHudKillDelta = if (latestHudKills != null && liveKda != null) {
+                (latestHudKills - liveKda.kills).coerceAtLeast(0)
+            } else {
+                0
+            }
             val status = when {
+                isAnalyzing && scanProgress != null -> "Scanning gameplay"
+                isAnalyzing -> "Preparing scan"
                 scanResult == null -> "Waiting for scan"
                 scanResult.reviewDetections.isNotEmpty() -> "Review ${scanResult.reviewDetections.size} uncertain moment(s)"
-                baseline == null -> "Waiting for stable upper-right K/D/A values"
+                baseline == null -> "Waiting for stable K/D/A values in the calibrated HUD region"
                 scanResult.events.isNotEmpty() -> "Kill Detected"
                 else -> "Tracking"
             }
 
             Text("Status: $status", color = RecorderTheme.textSecondary)
             Text(
+                "Kill moments confirmed: ${scanProgress?.confirmedKillCount ?: scanResult?.events?.size ?: 0}",
+                color = RecorderTheme.cyan,
+                fontWeight = FontWeight.SemiBold
+            )
+            if (scanProgress != null) {
+                Text(
+                    "Kills on HUD: ${latestHudKills ?: "—"}" +
+                        if (pendingHudKillDelta > 0) " (+$pendingHudKillDelta pending verification)" else "",
+                    color = RecorderTheme.cyan,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "Starting KDA: ${scanProgress.baselineKda?.let(::formatKda) ?: "Not confirmed yet"}",
+                    color = RecorderTheme.textSecondary
+                )
+                Text(
+                    "Latest HUD read ($observedKdaStatus): ${scanProgress.observedKda?.let(::formatKda) ?: "No valid reading"}",
+                    color = RecorderTheme.cyan
+                )
+                Text(
+                    "Confirmed live KDA: ${liveKda?.let(::formatKda) ?: "Reading HUD…"}",
+                    color = RecorderTheme.textSecondary
+                )
+                if (scanProgress.lastKillFrom != null && scanProgress.lastKillTo != null) {
+                    Text(
+                        "Latest kill check: ${scanProgress.lastKillFrom} → ${scanProgress.lastKillTo}" +
+                            (scanProgress.confidence?.let { " · ${ (it * 100).roundToInt() }%" } ?: ""),
+                        color = RecorderTheme.textSecondary
+                    )
+                }
+                scanProgress.counterIncrease?.let { change ->
+                    Text(
+                        "Counter change observed: ${change.previousKills} → ${change.currentKills} " +
+                            "(+${change.killsAdded}) at ${formatEditorTime(change.firstObservedAtMs)}; " +
+                            "confirmed at ${formatEditorTime(change.confirmedAtMs)}",
+                        color = RecorderTheme.cyan
+                    )
+                }
+                Text("Check: ${scanProgress.decision}", color = RecorderTheme.textSecondary)
+            }
+            Text(
                 "Tracked KDA: ${baseline?.let(::formatKda) ?: "Not confirmed"}" +
-                    (current?.let { " → ${formatKda(it)}" } ?: ""),
+                    ((if (isAnalyzing) liveKda else current)?.let { " → ${formatKda(it)}" } ?: ""),
                 color = RecorderTheme.textSecondary
             )
             Text(
@@ -851,10 +1090,6 @@ private fun KdaTrackerDiagnostics(
             )
             Text(
                 "Current Kills: ${scanResult?.currentKills?.toString() ?: "—"}",
-                color = RecorderTheme.textSecondary
-            )
-            Text(
-                "Kill Feed: ${scanResult?.lastKillFeedType?.label ?: "Not detected"}",
                 color = RecorderTheme.textSecondary
             )
             val increase = scanResult?.killIncrease ?: 0
@@ -868,7 +1103,7 @@ private fun KdaTrackerDiagnostics(
                 } else if (baseline == null) {
                     "Highlight Trigger: Waiting for tracked KDA"
                 } else {
-                    "Highlight: IGNORED · Kill-feed event did not increase tracked player's kills."
+                    "Highlight: No verified increase in your KDA kill counter."
                 },
                 color = if (increase > 0) RecorderTheme.cyan else RecorderTheme.textSecondary
             )
@@ -886,6 +1121,7 @@ private fun ClipEditor(
     advanced: Boolean,
     onAdvancedChanged: (Boolean) -> Unit,
     onClipChanged: (HighlightClip) -> Unit,
+    onApplyEffectToAll: (EffectPreset) -> Unit,
     onClipRemoved: () -> Unit
 ) {
     val eventTimeInClip = (clip.eventTimeMs - clip.startMs).coerceIn(0L, clip.durationMs)
@@ -1001,6 +1237,12 @@ private fun ClipEditor(
                         label = { Text(intensity.label) }
                     )
                 }
+            }
+            OutlinedButton(
+                onClick = { onApplyEffectToAll(clip.effectPreset) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Apply effect to all moments")
             }
             OutlinedButton(
                 onClick = { onAdvancedChanged(!advanced) },

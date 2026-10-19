@@ -27,7 +27,8 @@ class AutoHighlightEngine(
         sourceUri: Uri,
         trimStartMs: Long,
         trimEndMs: Long,
-        hudRegion: HudRegion = HudRegion.DEFAULT
+        hudRegion: HudRegion = HudRegion.DEFAULT,
+        onProgress: (KdaScanProgress) -> Unit = {}
     ): HighlightScanResult = withContext(Dispatchers.IO) {
         val retriever = MediaMetadataRetriever()
         try {
@@ -57,11 +58,13 @@ class AutoHighlightEngine(
             val detector = detectorFactory(hudRegion)
             try {
                 val detectedKills = mutableListOf<HighlightEvent>()
+                val counterIncreases = mutableListOf<com.mlbb.highlight.detection.KdaCounterIncrease>()
+                var latestCounterIncrease: com.mlbb.highlight.detection.KdaCounterIncrease? = null
                 val reviewDetections = mutableListOf<HighlightReview>()
-                val bannerObservations = mutableListOf<Pair<Long, HighlightEventType>>()
                 val debugObservations = ArrayDeque<KdaSampleDiagnostic>()
                 val tracker = MyKdaTracker(
-                    maximumStableSampleGapMs = sampleIntervalMs * REQUIRED_STABLE_READINGS
+                    maximumStableSampleGapMs = sampleIntervalMs * REQUIRED_STABLE_READINGS,
+                    requiredStableReadings = REQUIRED_STABLE_READINGS
                 )
                 val metadataWidth = retriever.extractMetadata(
                     MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH
@@ -74,7 +77,7 @@ class AutoHighlightEngine(
                     metadataHeight,
                     SAMPLE_MAX_EDGE
                 )
-                for (presentationTimeUs in presentationTimesUs) {
+                for ((sampleIndex, presentationTimeUs) in presentationTimesUs.withIndex()) {
                     val sampleTimeMs = presentationTimeUs / 1_000L
                     val frame = retriever.getScaledFrameAtTime(
                         presentationTimeUs,
@@ -84,25 +87,25 @@ class AutoHighlightEngine(
                     ) ?: continue
                     try {
                         val result = detector.analyze(frame, sampleTimeMs)
-                        result.eventType
-                            ?.takeIf { it in CLASSIFIABLE_BANNERS }
-                            ?.let { bannerObservations += sampleTimeMs to it }
                         val candidates = result.kdaCandidates.mapNotNull { reading ->
                             MyKdaTracker.from(reading, frame.width, frame.height)
                         }
                         val update: KdaTrackerUpdate = tracker.observe(
                             candidates = candidates,
-                            sourceTimeMs = sampleTimeMs,
-                            supportingBanner = null
+                            sourceTimeMs = sampleTimeMs
                         )
-                        val candidateSummaries = result.kdaCandidates.map { reading ->
+                        val candidateSummaries = result.parsedKdaCandidates.map { reading ->
                             KdaCandidateDiagnostic(
                                 kda = KdaSnapshot(reading.kills, reading.deaths, reading.assists),
                                 confidence = reading.confidence,
                                 bounds = reading.bounds.toShortString()
                             )
                         }
-                        val rawOcr = update.rawOcrResult ?: result.kdaCandidates.firstOrNull()?.rawText
+                        val acceptedSummaries = result.kdaCandidates.map { reading ->
+                            "${reading.kills}/${reading.deaths}/${reading.assists}@${reading.bounds.toShortString()}"
+                        }
+                        val rawOcr = update.rawOcrResult ?: result.rawOcrText
+                            .ifBlank { result.kdaCandidates.firstOrNull()?.rawText.orEmpty() }
                         val firstChar = update.firstChar ?: result.kdaCandidates.firstOrNull()?.firstChar
                         val lastK = update.lastConfirmedK ?: tracker.lastConfirmedKills
                         val conf = update.selectedCandidate?.confidence ?: result.confidence
@@ -116,30 +119,49 @@ class AutoHighlightEngine(
                                 detectedText = result.textObservations,
                                 rejectedDetections = result.rejectedDetections,
                                 visualCues = result.visualCues,
-                                selectedEventTimestampMs = update.killEvent?.sourceTimeMs,
+                                acceptedKda = acceptedSummaries,
+                                counterIncrease = update.counterIncrease,
                                 rawOcrText = rawOcr,
                                 firstChar = firstChar,
                                 lastConfirmedK = lastK,
                                 confidence = conf,
-                                isKillConfirmed = update.killConfirmed
+                                counterIncreaseConfirmed = update.killConfirmed
                             )
                         )
                         while (debugObservations.size > MAX_DEBUG_OBSERVATIONS) {
                             debugObservations.removeFirst()
                         }
-                        if (BuildConfig.DEBUG && update.decision != "Tracked K/D/A unchanged") {
+                        if (BuildConfig.DEBUG) {
                             Log.d(
                                 DEBUG_TAG,
-                                "sample=${sampleTimeMs}ms rawOcr=$rawOcr firstChar=$firstChar lastK=$lastK " +
-                                    "confirmed=${update.killConfirmed} decision=${update.decision}"
+                                "framePts=${sampleTimeMs}ms size=${frame.width}x${frame.height} " +
+                                    "ocr=${result.rawOcrText} " +
+                                    "parsed=${candidateSummaries.map { "${it.kda}@${it.bounds}(conf=${it.confidence})" }} " +
+                                    "accepted=$acceptedSummaries " +
+                                    "confidence=$conf rejected=${result.rejectedDetections} " +
+                                    "selected=$rawOcr firstChar=$firstChar lastK=$lastK " +
+                                    "killConfirmed=${update.killConfirmed} decision=${update.decision}"
                             )
+                        }
+                        update.counterIncrease?.let { change ->
+                            latestCounterIncrease = change
+                            if (counterIncreases.none {
+                                    it.firstObservedAtMs == change.firstObservedAtMs &&
+                                        it.previousKills == change.previousKills &&
+                                        it.currentKills == change.currentKills
+                                }
+                            ) counterIncreases += change
                         }
                         update.killEvent?.let { event ->
                             detectedKills += event
                             if (BuildConfig.DEBUG) {
                                 Log.i(
                                     DEBUG_TAG,
-                                    "highlight confirmed at ${event.sourceTimeMs}ms: " +
+                                    "KDA transition estimated=${event.sourceTimeMs}ms " +
+                                        "previousRead=${event.counterObservedFromMs}ms " +
+                                        "firstIncreasedRead=${event.counterFirstObservedAtMs}ms " +
+                                        "confirmed=${event.counterConfirmedAtMs}ms " +
+                                        "(${event.killsAdded ?: 0} added): " +
                                         "${update.previousKills} -> ${update.currentKills}, " +
                                         "confidence=${event.confidence}"
                                 )
@@ -166,18 +188,38 @@ class AutoHighlightEngine(
                                 )
                             }
                         }
+                        withContext(Dispatchers.Main.immediate) {
+                            onProgress(
+                                KdaScanProgress(
+                                    sampleIndex = sampleIndex + 1,
+                                    sampleCount = presentationTimesUs.size,
+                                    sourceTimeMs = sampleTimeMs,
+                                    baselineKda = tracker.baseline,
+                                    currentKda = tracker.current,
+                                    observedKda = update.selectedCandidate?.takeIf {
+                                        it.isFirstDigitValid && it.isTripletNumericallyValid
+                                    }?.snapshot,
+                                    confirmedKillCount = detectedKills.size,
+                                    lastKillFrom = update.previousKills,
+                                    lastKillTo = update.currentKills,
+                                    decision = update.decision,
+                                    confidence = update.selectedCandidate?.confidence,
+                                    counterIncrease = latestCounterIncrease
+                                )
+                            )
+                        }
                     } finally {
                         frame.recycle()
                     }
                 }
                 HighlightScanResult(
                     events = detectedKills,
+                    counterIncreases = counterIncreases,
                     baselineKda = tracker.baseline,
                     finalKda = tracker.current,
                     previousKills = tracker.lastKillPrevious ?: tracker.current?.kills
                         ?: tracker.baseline?.kills,
                     currentKills = tracker.lastKillCurrent ?: tracker.current?.kills,
-                    lastKillFeedType = bannerObservations.lastOrNull()?.second,
                     killIncrease = tracker.lastKillCurrent?.minus(tracker.lastKillPrevious ?: 0),
                     debugObservations = debugObservations.toList(),
                     reviewDetections = reviewDetections
@@ -342,35 +384,43 @@ class AutoHighlightEngine(
     }
 
     private companion object {
-        const val SAMPLE_INTERVAL_MS = 1_000L
-        const val MAX_SAMPLES = 600L
+        const val SAMPLE_INTERVAL_MS = 500L
+        const val MAX_SAMPLES = 1_800L
         const val PRE_EVENT_MS = 2_500L
         const val POST_EVENT_MS = 1_500L
         const val MERGE_GAP_MS = 1_000L
         const val SAMPLE_MAX_EDGE = 1280
-        const val REQUIRED_STABLE_READINGS = 3
+        const val REQUIRED_STABLE_READINGS = 2
         const val MAX_DEBUG_OBSERVATIONS = 80
         const val DEBUG_TAG = "AutoHighlight"
-        val CLASSIFIABLE_BANNERS = setOf(
-            HighlightEventType.FIRST_BLOOD,
-            HighlightEventType.KILL,
-            HighlightEventType.DOUBLE_KILL,
-            HighlightEventType.TRIPLE_KILL,
-            HighlightEventType.MANIAC,
-            HighlightEventType.SAVAGE
-        )
     }
 
     data class HighlightScanResult(
         val events: List<HighlightEvent>,
+        val counterIncreases: List<com.mlbb.highlight.detection.KdaCounterIncrease> = emptyList(),
         val baselineKda: com.mlbb.highlight.detection.KdaSnapshot?,
         val finalKda: com.mlbb.highlight.detection.KdaSnapshot?,
         val previousKills: Int?,
         val currentKills: Int?,
-        val lastKillFeedType: HighlightEventType?,
         val killIncrease: Int?,
         val debugObservations: List<KdaSampleDiagnostic> = emptyList(),
         val reviewDetections: List<HighlightReview> = emptyList()
+    )
+
+    data class KdaScanProgress(
+        val sampleIndex: Int,
+        val sampleCount: Int,
+        val sourceTimeMs: Long,
+        val baselineKda: KdaSnapshot?,
+        val currentKda: KdaSnapshot?,
+        /** Latest valid OCR candidate, which may still be pending confirmation. */
+        val observedKda: KdaSnapshot? = null,
+        val confirmedKillCount: Int,
+        val lastKillFrom: Int?,
+        val lastKillTo: Int?,
+        val decision: String,
+        val confidence: Float?,
+        val counterIncrease: com.mlbb.highlight.detection.KdaCounterIncrease? = null
     )
 
     data class KdaSampleDiagnostic(
@@ -382,12 +432,13 @@ class AutoHighlightEngine(
         val detectedText: List<com.mlbb.highlight.detection.OcrTextObservation> = emptyList(),
         val rejectedDetections: List<String> = emptyList(),
         val visualCues: List<com.mlbb.highlight.detection.HudVisualCue> = emptyList(),
-        val selectedEventTimestampMs: Long? = null,
+        val acceptedKda: List<String> = emptyList(),
+        val counterIncrease: com.mlbb.highlight.detection.KdaCounterIncrease? = null,
         val rawOcrText: String? = null,
         val firstChar: String? = null,
         val lastConfirmedK: Int? = null,
         val confidence: Float? = null,
-        val isKillConfirmed: Boolean = false
+        val counterIncreaseConfirmed: Boolean = false
     )
 
     data class KdaCandidateDiagnostic(

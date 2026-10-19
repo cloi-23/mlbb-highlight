@@ -1,6 +1,8 @@
 package com.mlbb.highlight.highlight
 
+import android.content.Context
 import android.net.Uri
+import android.media.MediaMetadataRetriever
 import androidx.media3.common.C
 import androidx.media3.common.Effect
 import androidx.media3.common.MediaItem
@@ -22,7 +24,8 @@ import com.mlbb.highlight.ui.createOpeningFlashEffect
  */
 fun buildHighlightComposition(
     timeline: HighlightTimeline,
-    settings: AppSettings = AppSettings()
+    settings: AppSettings = AppSettings(),
+    context: Context? = null
 ): Composition {
     val trimStartMs = timeline.sourceTrimStartMs.coerceAtLeast(0L)
     val sourceDurationMs = (timeline.sourceTrimEndMs - trimStartMs).coerceAtLeast(0L)
@@ -107,8 +110,74 @@ fun buildHighlightComposition(
 
     // Original audio remains attached to each selected moment; optional music loops under the montage.
     val sequences = mutableListOf(videoSequence)
+    val killSoundEnabled = timeline.enableKillSound
+    val killSoundUri = "android.resource://${context?.packageName ?: "com.mlbb.highlight"}/raw/default_kill_sound"
+    val killSoundDurationMs = if (killSoundEnabled && context != null) {
+        runCatching {
+            MediaMetadataRetriever().run {
+                setDataSource(context, Uri.parse(killSoundUri))
+                extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
+                    ?.also { release() }
+                    ?: run { release(); DEFAULT_KILL_SOUND_DURATION_MS }
+            }
+        }.getOrDefault(DEFAULT_KILL_SOUND_DURATION_MS)
+    } else DEFAULT_KILL_SOUND_DURATION_MS
+    if (killSoundEnabled && context != null) {
+        var outputOffsetMs = 0L
+        val cues = clips.flatMap { (clip, range) ->
+            val clipCues = clip.events.mapNotNull { event ->
+                val adjustedEventMs = event.sourceTimeMs - trimStartMs +
+                    (clip.eventTimeMs - clip.detectedEventTimeMs)
+                val inClipMs = adjustedEventMs - range.first
+                if (inClipMs in 0 until (clip.endMs - clip.startMs)) {
+                    outputOffsetMs + inClipMs
+                } else null
+            }
+            outputOffsetMs += range.second - range.first
+            clipCues
+        }.sorted()
+        val audioItems = mutableListOf<EditedMediaItem>()
+        var cursorMs = 0L
+        cues.forEach { cueMs ->
+            val cue = cueMs.coerceAtLeast(cursorMs)
+            var silenceMs = cue - cursorMs
+            while (silenceMs > 0L) {
+                val chunkMs = silenceMs.coerceAtMost(SILENCE_RESOURCE_DURATION_MS)
+                val silence = MediaItem.Builder()
+                    .setUri(Uri.parse("android.resource://${context.packageName}/raw/silence_60s"))
+                    .setClippingConfiguration(
+                        MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(0L)
+                            .setEndPositionMs(chunkMs)
+                            .build()
+                    )
+                    .build()
+                audioItems += EditedMediaItem.Builder(silence).setRemoveVideo(true).build()
+                silenceMs -= chunkMs
+            }
+            val gain = GainProcessor(object : GainProcessor.GainProvider {
+                override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float =
+                    timeline.killSoundVolume.coerceIn(0f, 1f)
+
+                override fun isUnityUntil(samplePosition: Long, sampleRateHz: Int): Long =
+                    if (timeline.killSoundVolume >= 1f) C.TIME_END_OF_SOURCE else C.TIME_UNSET
+            })
+            audioItems += EditedMediaItem.Builder(MediaItem.fromUri(Uri.parse(killSoundUri)))
+                .setRemoveVideo(true)
+                .setEffects(Effects(listOf(gain), emptyList()))
+                .build()
+            cursorMs = cue + killSoundDurationMs
+        }
+        if (audioItems.isNotEmpty()) {
+            sequences += EditedMediaItemSequence.Builder(
+                audioItems.first(), *audioItems.drop(1).toTypedArray()
+            ).build()
+        }
+    }
     val musicUri = timeline.musicUri
-    val bgMusicEnabled = settings.enableBackgroundMusic || musicUri != null
+    // The kill cue takes priority over the optional backing track to keep the
+    // moment sound clear. Original gameplay audio remains in the video sequence.
+    val bgMusicEnabled = !killSoundEnabled && (settings.enableBackgroundMusic || musicUri != null)
     if (bgMusicEnabled && musicUri != null) {
         val configuredVolume = if (settings.musicVolume > 0f) settings.musicVolume else timeline.musicVolume
         val effectiveVolume = configuredVolume.coerceIn(0f, 1f)
@@ -135,6 +204,9 @@ fun buildHighlightComposition(
 
     return Composition.Builder(sequences).build()
 }
+
+private const val DEFAULT_KILL_SOUND_DURATION_MS = 1_000L
+private const val SILENCE_RESOURCE_DURATION_MS = 60_000L
 
 data class HighlightValidationResult(
     val isValid: Boolean,

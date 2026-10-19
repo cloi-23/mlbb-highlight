@@ -30,7 +30,7 @@ class SettingsRepository(context: Context) {
             enableScreenShake = prefs.getBoolean(KEY_ENABLE_SCREEN_SHAKE, true),
             enableSlowMotion = prefs.getBoolean(KEY_ENABLE_SLOW_MOTION, true),
             enableImpactFlash = prefs.getBoolean(KEY_ENABLE_IMPACT_FLASH, true),
-            enableKillSound = prefs.getBoolean(KEY_ENABLE_KILL_SOUND, false),
+            enableKillSound = prefs.getBoolean(KEY_ENABLE_KILL_SOUND, true),
             enableBackgroundMusic = prefs.getBoolean(KEY_ENABLE_BACKGROUND_MUSIC, false),
             musicVolume = prefs.getFloat(KEY_MUSIC_VOLUME, 0.13f)
         )
