@@ -65,7 +65,7 @@ data class EffectPreset(
     val videoPreset: VideoEffectPreset,
     val intensity: EffectIntensity = EffectIntensity.MEDIUM,
     val slowMotionSpeed: Float = 0.25f,
-    val zoomAmount: Float = 0.08f,
+    val zoomAmount: Float = 0f,
     val shakeAmount: Float = 1.0f
 ) {
     fun toVideoOptions(): VideoEffectOptions {
@@ -231,19 +231,9 @@ fun HighlightEventType.effectPreset(style: HighlightStyle): EffectPreset {
         name = "MLBB Cinematic Kill",
         videoPreset = selectedPreset,
         intensity = intensity,
-        slowMotionSpeed = if (style == HighlightStyle.CINEMATIC) 0.5f else 0.65f,
-        zoomAmount = when (style) {
-            HighlightStyle.CLEAN -> 0.04f
-            HighlightStyle.AGGRESSIVE -> 0.12f
-            HighlightStyle.CINEMATIC,
-            HighlightStyle.CLASSIC -> 0.08f
-        },
-        shakeAmount = when (style) {
-            HighlightStyle.CLEAN -> 0.1f
-            HighlightStyle.AGGRESSIVE -> 0.45f
-            HighlightStyle.CINEMATIC,
-            HighlightStyle.CLASSIC -> 0.2f
-        }
+        slowMotionSpeed = 0.25f,
+        zoomAmount = 0f,
+        shakeAmount = 1f
     )
 }
 

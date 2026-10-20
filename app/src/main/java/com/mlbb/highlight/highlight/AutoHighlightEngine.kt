@@ -319,10 +319,16 @@ class AutoHighlightEngine(
         }
 
         val clips = groups.map { group ->
-            val firstEventMs = group.first().sourceTimeMs - trimStartMs
-            val lastEventMs = group.last().sourceTimeMs - trimStartMs
-            val startMs = (firstEventMs - PRE_EVENT_MS).coerceAtLeast(0L)
-            val endMs = (lastEventMs + POST_EVENT_MS).coerceAtMost(durationMs)
+            val firstEventMs = group.first().sourceTimeMs - effectiveStartMs
+            val lastEventMs = group.last().sourceTimeMs - effectiveStartMs
+            var startMs = (firstEventMs - PRE_EVENT_MS).coerceAtLeast(0L)
+            var endMs = (lastEventMs + POST_EVENT_MS).coerceAtMost(durationMs)
+            if (endMs - startMs < MIN_CLIP_DURATION_MS) {
+                val missingMs = MIN_CLIP_DURATION_MS - (endMs - startMs)
+                val extendAfter = minOf(missingMs, durationMs - endMs)
+                endMs += extendAfter
+                startMs = (startMs - (missingMs - extendAfter)).coerceAtLeast(0L)
+            }
             val primary = group.maxByOrNull { eventPriority(it.type) } ?: group.first()
             val effectPreset = primary.type.effectPreset(style)
             HighlightClip(
@@ -348,11 +354,7 @@ class AutoHighlightEngine(
                         effectPreset.slowMotionSpeed
                     )
                 },
-                textOverlay = TextOverlay(
-                    text = primary.type.overlayText,
-                    startMs = (primary.sourceTimeMs - trimStartMs - 400L).coerceAtLeast(startMs),
-                    endMs = (primary.sourceTimeMs - trimStartMs + 900L).coerceAtMost(endMs)
-                )
+                textOverlay = null
             )
         }.filter { it.endMs > it.startMs }
         return HighlightTimeline(
@@ -386,8 +388,9 @@ class AutoHighlightEngine(
     private companion object {
         const val SAMPLE_INTERVAL_MS = 500L
         const val MAX_SAMPLES = 1_800L
-        const val PRE_EVENT_MS = 2_500L
-        const val POST_EVENT_MS = 1_500L
+        const val PRE_EVENT_MS = 4_000L
+        const val POST_EVENT_MS = 6_000L
+        const val MIN_CLIP_DURATION_MS = 10_000L
         const val MERGE_GAP_MS = 1_000L
         const val SAMPLE_MAX_EDGE = 1280
         const val REQUIRED_STABLE_READINGS = 2

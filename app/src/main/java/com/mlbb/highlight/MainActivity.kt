@@ -1103,6 +1103,7 @@ class MainActivity : ComponentActivity() {
                                             trimStartMs = trimStartMs,
                                             trimEndMs = trimEndMs,
                                             sourceDurationMs = sourceDurationMs,
+                                            onPickVideo = { videoPickerLauncher.launch(arrayOf("video/*")) },
                                             onTrimChanged = { start, end ->
                                                 val safeStart = start.coerceAtLeast(0L)
                                                 val safeEnd = end.coerceAtLeast(safeStart)
@@ -1209,20 +1210,6 @@ class MainActivity : ComponentActivity() {
                                                 highlightTimeline = highlightTimeline?.let { timeline ->
                                                     timeline.copy(
                                                         clips = timeline.clips.filterNot { it.id == removed.id }
-                                                    )
-                                                }
-                                                isEffectPreviewApplied = false
-                                            },
-                                            onStyleChanged = { style ->
-                                                highlightStyle = style
-                                                highlightTimeline = highlightTimeline?.let { timeline ->
-                                                    timeline.copy(
-                                                        style = style,
-                                                        clips = timeline.clips.map { clip ->
-                                                            clip.primaryEvent?.let { event ->
-                                                                clip.copy(effectPreset = event.type.effectPreset(style))
-                                                            } ?: clip
-                                                        }
                                                     )
                                                 }
                                                 isEffectPreviewApplied = false

@@ -33,7 +33,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -81,8 +80,6 @@ import com.mlbb.highlight.highlight.HighlightResolution
 import com.mlbb.highlight.highlight.HighlightStyle
 import com.mlbb.highlight.highlight.HighlightTimeline
 import com.mlbb.highlight.highlight.AutoHighlightEngine
-import com.mlbb.highlight.highlight.TextOverlay
-import com.mlbb.highlight.highlight.TextPosition
 import com.mlbb.highlight.highlight.buildHighlightSpeedProvider
 import com.mlbb.highlight.highlight.withEventTimingOffset
 import com.mlbb.highlight.detection.HudRegion
@@ -97,6 +94,7 @@ fun AutoHighlightScreen(
     trimStartMs: Long,
     trimEndMs: Long,
     sourceDurationMs: Long,
+    onPickVideo: () -> Unit,
     onTrimChanged: (Long, Long) -> Unit,
     timeline: HighlightTimeline?,
     detectedEvents: List<HighlightEvent>,
@@ -117,7 +115,6 @@ fun AutoHighlightScreen(
     onClipChanged: (HighlightClip) -> Unit,
     onApplyEffectToAll: (EffectPreset) -> Unit,
     onClipRemoved: (HighlightClip) -> Unit,
-    onStyleChanged: (HighlightStyle) -> Unit,
     onAspectRatioChanged: (HighlightAspectRatio) -> Unit,
     onResolutionChanged: (HighlightResolution) -> Unit,
     onChooseMusic: () -> Unit,
@@ -131,9 +128,6 @@ fun AutoHighlightScreen(
     val clipIds = timeline?.clips?.map(HighlightClip::id)
     var selectedClipId by remember(clipIds) {
         mutableStateOf(timeline?.clips?.firstOrNull()?.id.orEmpty())
-    }
-    var style by rememberSaveable(timeline?.style) {
-        mutableStateOf(timeline?.style ?: HighlightStyle.CINEMATIC)
     }
     var playheadMs by remember(videoUri) { mutableLongStateOf(trimStartMs) }
     var showAdvanced by rememberSaveable(selectedClipId) { mutableStateOf(false) }
@@ -193,11 +187,14 @@ fun AutoHighlightScreen(
         if (videoUri == null) {
             EmptyEditorCard(
                 title = "Choose a gameplay video",
-                message = "Import or record a video before generating highlights.",
-                buttonLabel = "Back to Trim",
-                onClick = onBack
+                message = "Select a video here to start creating highlights.",
+                buttonLabel = "Choose video",
+                onClick = onPickVideo
             )
         } else {
+            OutlinedButton(onClick = onPickVideo, modifier = Modifier.fillMaxWidth()) {
+                Text("Choose a different video")
+            }
             Row(
                 modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -269,16 +266,13 @@ fun AutoHighlightScreen(
                 }
                 "Highlights" -> {
                     Text("Find and review moments", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
-                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        HighlightStyle.entries.forEach { option ->
-                            FilterChip(selected = style == option, onClick = {
-                                style = option
-                                onStyleChanged(option)
-                            }, label = { Text(option.label) })
-                        }
-                    }
+                    Text(
+                        "Cinematic is applied automatically. Fine-tune speed and shake under Effects → Advanced settings.",
+                        color = RecorderTheme.textSecondary,
+                        style = MaterialTheme.typography.bodySmall
+                    )
                     Button(
-                        onClick = { onAnalyze(style) },
+                        onClick = { onAnalyze(HighlightStyle.CINEMATIC) },
                         enabled = !isAnalyzing && !isExporting,
                         modifier = Modifier.fillMaxWidth().height(48.dp)
                     ) {
@@ -695,18 +689,6 @@ private fun HudCalibrationCard(
             }
             verificationStatus?.let { status ->
                 Text(status, color = RecorderTheme.textSecondary, style = MaterialTheme.typography.bodySmall)
-            }
-
-            // Presets
-            Text("Calibration presets", color = RecorderTheme.textSecondary, style = MaterialTheme.typography.labelMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                HudRegion.PRESETS.forEach { (label, presetRegion) ->
-                    FilterChip(
-                        selected = region == presetRegion,
-                        onClick = { onRegionChanged(presetRegion) },
-                        label = { Text(label) }
-                    )
-                }
             }
 
             CalibrationSlider("Left", region.left, 0f..(region.right - HudRegion.MIN_REGION_SIZE)) {
@@ -1291,19 +1273,6 @@ private fun ClipEditor(
                     valueRange = 0.25f..1.5f
                 )
                 Text(
-                    "Zoom · ${(clip.effectPreset.zoomAmount * 100f).roundToInt()}%",
-                    color = RecorderTheme.textSecondary
-                )
-                Slider(
-                    value = clip.effectPreset.zoomAmount,
-                    onValueChange = { zoom ->
-                        onClipChanged(
-                            clip.copy(effectPreset = clip.effectPreset.copy(zoomAmount = zoom))
-                        )
-                    },
-                    valueRange = 0f..0.2f
-                )
-                Text(
                     "Shake · ${(clip.effectPreset.shakeAmount * 100f).roundToInt()}%",
                     color = RecorderTheme.textSecondary
                 )
@@ -1316,42 +1285,6 @@ private fun ClipEditor(
                     },
                     valueRange = 0f..1f
                 )
-                TextField(
-                    value = clip.textOverlay?.text.orEmpty(),
-                    onValueChange = { text ->
-                        val overlay = clip.textOverlay?.copy(text = text)
-                            ?: TextOverlay(
-                                text,
-                                clip.startMs + eventTimeInClip,
-                                clip.startMs + eventTimeInClip + 900L
-                            )
-                        onClipChanged(clip.copy(textOverlay = overlay))
-                    },
-                    label = { Text("Kill text") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Text("Text position", color = RecorderTheme.textSecondary)
-                Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                    TextPosition.entries.forEach { position ->
-                        FilterChip(
-                            selected = clip.textOverlay?.position == position,
-                            onClick = {
-                                val overlay = clip.textOverlay ?: TextOverlay(
-                                    text = "",
-                                    startMs = clip.startMs + eventTimeInClip,
-                                    endMs = clip.startMs + eventTimeInClip + 900L
-                                )
-                                onClipChanged(
-                                    clip.copy(textOverlay = overlay.copy(position = position))
-                                )
-                            },
-                            label = {
-                                Text(position.name.lowercase().replaceFirstChar(Char::uppercase))
-                            }
-                        )
-                    }
-                }
             }
             OutlinedButton(onClick = onClipRemoved, modifier = Modifier.fillMaxWidth()) {
                 Text("Remove moment")
