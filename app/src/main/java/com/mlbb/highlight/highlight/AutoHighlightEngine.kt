@@ -61,6 +61,7 @@ class AutoHighlightEngine(
                 val counterIncreases = mutableListOf<com.mlbb.highlight.detection.KdaCounterIncrease>()
                 var latestCounterIncrease: com.mlbb.highlight.detection.KdaCounterIncrease? = null
                 val reviewDetections = mutableListOf<HighlightReview>()
+                var lastUnconfirmedHudIncrease: PendingHudIncrease? = null
                 val debugObservations = ArrayDeque<KdaSampleDiagnostic>()
                 val tracker = MyKdaTracker(
                     maximumStableSampleGapMs = sampleIntervalMs * REQUIRED_STABLE_READINGS,
@@ -168,12 +169,34 @@ class AutoHighlightEngine(
                             }
                         }
                         val reviewCandidate = update.selectedCandidate
+                        val confirmedKills = tracker.lastConfirmedKills
+                        if (
+                            reviewCandidate != null &&
+                            reviewCandidate.isFirstDigitValid &&
+                            reviewCandidate.isTripletNumericallyValid &&
+                            confirmedKills != null &&
+                            reviewCandidate.snapshot.kills > confirmedKills
+                        ) {
+                            lastUnconfirmedHudIncrease = PendingHudIncrease(
+                                sourceTimeMs = sampleTimeMs,
+                                previousKills = confirmedKills,
+                                candidate = reviewCandidate
+                            )
+                        } else if (
+                            reviewCandidate != null &&
+                            reviewCandidate.isFirstDigitValid &&
+                            reviewCandidate.isTripletNumericallyValid &&
+                            confirmedKills != null &&
+                            reviewCandidate.snapshot.kills <= confirmedKills
+                        ) {
+                            lastUnconfirmedHudIncrease = null
+                        }
                         if (
                             update.decision.startsWith("Kill increase needs review") &&
                             reviewCandidate != null
                         ) {
-                            val previousKills = update.previousKills ?: continue
-                            if (reviewDetections.none {
+                            val previousKills = update.previousKills ?: tracker.lastConfirmedKills
+                            if (previousKills != null && reviewDetections.none {
                                     it.previousKills == previousKills &&
                                         it.currentKills == reviewCandidate.snapshot.kills
                                 }
@@ -210,6 +233,22 @@ class AutoHighlightEngine(
                         }
                     } finally {
                         frame.recycle()
+                    }
+                }
+                lastUnconfirmedHudIncrease?.let { pending ->
+                    if (reviewDetections.none {
+                            it.previousKills == pending.previousKills &&
+                                it.currentKills == pending.candidate.snapshot.kills
+                        }
+                    ) {
+                        reviewDetections += HighlightReview(
+                            id = UUID.randomUUID().toString(),
+                            sourceTimeMs = pending.sourceTimeMs,
+                            previousKills = pending.previousKills,
+                            currentKills = pending.candidate.snapshot.kills,
+                            confidence = pending.candidate.confidence,
+                            reason = "HUD kill count increased but did not remain stable before the scan ended; confirm this moment manually."
+                        )
                     }
                 }
                 HighlightScanResult(
@@ -397,6 +436,12 @@ class AutoHighlightEngine(
         const val MAX_DEBUG_OBSERVATIONS = 80
         const val DEBUG_TAG = "AutoHighlight"
     }
+
+    private data class PendingHudIncrease(
+        val sourceTimeMs: Long,
+        val previousKills: Int,
+        val candidate: com.mlbb.highlight.detection.PositionedKda
+    )
 
     data class HighlightScanResult(
         val events: List<HighlightEvent>,

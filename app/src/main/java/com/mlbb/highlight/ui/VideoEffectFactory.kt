@@ -83,8 +83,12 @@ fun createSceneVideoEffects(
             }
             VideoEffectPreset.FLASH,
             VideoEffectPreset.NONE,
-            VideoEffectPreset.SLOW_MOTION,
-            VideoEffectPreset.KILL_SLOWMO -> Unit
+            VideoEffectPreset.KILL_SLOWMO -> {
+                if (options.shakeEnabled) {
+                    add(createKillShakeEffect(intensity, options.shakeAmount, eventTimeUs, sceneEndUs))
+                }
+            }
+            VideoEffectPreset.SLOW_MOTION -> Unit
             VideoEffectPreset.BLUR ->
                 add(TimestampWrapper(GaussianBlur(2f + 14f * options.blurAmount.coerceIn(0f, 1f)), sceneStartUs, sceneEndUs))
             VideoEffectPreset.BRIGHTNESS ->

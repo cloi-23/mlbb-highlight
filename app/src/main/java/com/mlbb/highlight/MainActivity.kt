@@ -195,7 +195,8 @@ class MainActivity : ComponentActivity() {
                         mutableStateOf<AutoHighlightEngine.KdaScanProgress?>(null)
                     }
                     var highlightTimeline by remember { mutableStateOf<HighlightTimeline?>(null) }
-                    var highlightStyle by rememberSaveable { mutableStateOf(HighlightStyle.CINEMATIC) }
+                    var gameAudioMuted by rememberSaveable { mutableStateOf(false) }
+                    var highlightStyle by rememberSaveable { mutableStateOf(HighlightStyle.CLASSIC) }
                     var isAnalyzingHighlights by remember { mutableStateOf(false) }
                     var highlightAnalysisMessage by remember { mutableStateOf<String?>(null) }
                     var isExporting by remember { mutableStateOf(false) }
@@ -216,7 +217,7 @@ class MainActivity : ComponentActivity() {
                         highlightScanResult = null
                         highlightTimeline = null
                         highlightAnalysisMessage = null
-                        highlightStyle = HighlightStyle.CINEMATIC
+                        highlightStyle = HighlightStyle.CLASSIC
                         sourceDurationMs = 0L
                         effectStartMs = 0L
                         effectEndMs = 0L
@@ -291,7 +292,8 @@ class MainActivity : ComponentActivity() {
                                 )
                                 highlightTimeline = highlightTimeline?.copy(
                                     musicUri = uri.toString(),
-                                    musicVolume = highlightTimeline?.musicVolume ?: 0.2f
+                                    musicVolume = highlightTimeline?.musicVolume ?: 0.2f,
+                                    musicMuted = false
                                 )
                                 isEffectPreviewApplied = false
                                 exportMessage = "Music track added. Preview the highlight before exporting."
@@ -365,7 +367,13 @@ class MainActivity : ComponentActivity() {
                                     aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.VERTICAL,
                                     resolution = previous?.resolution ?: HighlightResolution.P1080,
                                     musicUri = previous?.musicUri,
-                                    musicVolume = previous?.musicVolume ?: 0.2f
+                                    musicVolume = previous?.musicVolume ?: 0.2f,
+                                    musicStartMs = previous?.musicStartMs ?: 0L,
+                                    musicEndMs = previous?.musicEndMs,
+                                    musicFadeInMs = previous?.musicFadeInMs ?: 0L,
+                                    musicFadeOutMs = previous?.musicFadeOutMs ?: 0L,
+                                    musicMuted = previous?.musicMuted ?: false,
+                                    gameAudioMuted = previous?.gameAudioMuted ?: gameAudioMuted,
                                 )
                                 isEffectPreviewApplied = false
                                 val baseline = scanResult.baselineKda
@@ -437,7 +445,13 @@ class MainActivity : ComponentActivity() {
                             aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.LANDSCAPE,
                             resolution = previous?.resolution ?: HighlightResolution.P1080,
                             musicUri = previous?.musicUri,
-                            musicVolume = previous?.musicVolume ?: 0.13f
+                            musicVolume = previous?.musicVolume ?: 0.13f,
+                            musicStartMs = previous?.musicStartMs ?: 0L,
+                            musicEndMs = previous?.musicEndMs,
+                            musicFadeInMs = previous?.musicFadeInMs ?: 0L,
+                            musicFadeOutMs = previous?.musicFadeOutMs ?: 0L,
+                            musicMuted = previous?.musicMuted ?: false,
+                            gameAudioMuted = previous?.gameAudioMuted ?: gameAudioMuted,
                         )
                         highlightAnalysisMessage = "Moment marked manually. It is not an automatic event detection."
                         isEffectPreviewApplied = false
@@ -1122,6 +1136,7 @@ class MainActivity : ComponentActivity() {
                                                 highlightAnalysisMessage = null
                                             },
                                             timeline = highlightTimeline,
+                                            gameAudioMuted = gameAudioMuted,
                                             detectedEvents = highlightEvents,
                                             scanResult = highlightScanResult,
                                             scanProgress = highlightScanProgress,
@@ -1167,7 +1182,13 @@ class MainActivity : ComponentActivity() {
                                                         aspectRatio = previous?.aspectRatio ?: HighlightAspectRatio.VERTICAL,
                                                         resolution = previous?.resolution ?: HighlightResolution.P1080,
                                                         musicUri = previous?.musicUri,
-                                                        musicVolume = previous?.musicVolume ?: 0.2f
+                                                        musicVolume = previous?.musicVolume ?: 0.2f,
+                                                        musicStartMs = previous?.musicStartMs ?: 0L,
+                                                        musicEndMs = previous?.musicEndMs,
+                                                        musicFadeInMs = previous?.musicFadeInMs ?: 0L,
+                                                        musicFadeOutMs = previous?.musicFadeOutMs ?: 0L,
+                                                        musicMuted = previous?.musicMuted ?: false,
+                                                        gameAudioMuted = previous?.gameAudioMuted ?: gameAudioMuted,
                                                     )
                                                     highlightScanResult = highlightScanResult?.let { result ->
                                                         result.copy(
@@ -1193,6 +1214,18 @@ class MainActivity : ComponentActivity() {
                                                             if (clip.id == updated.id) updated else clip
                                                         }
                                                     )
+                                                }
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onClipMoved = { clipId, targetIndex ->
+                                                highlightTimeline = highlightTimeline?.let { timeline ->
+                                                    val reordered = timeline.clips.toMutableList()
+                                                    val oldIndex = reordered.indexOfFirst { it.id == clipId }
+                                                    if (oldIndex >= 0) {
+                                                        val clip = reordered.removeAt(oldIndex)
+                                                        reordered.add(targetIndex.coerceIn(0, reordered.size), clip)
+                                                    }
+                                                    timeline.copy(clips = reordered)
                                                 }
                                                 isEffectPreviewApplied = false
                                             },
@@ -1225,19 +1258,36 @@ class MainActivity : ComponentActivity() {
                                             onChooseMusic = {
                                                 musicPickerLauncher.launch(arrayOf("audio/*"))
                                             },
+                                            onRemoveMusic = {
+                                                highlightTimeline = highlightTimeline?.copy(musicUri = null)
+                                                isEffectPreviewApplied = false
+                                            },
                                             onMusicVolumeChanged = { volume ->
                                                 highlightTimeline = highlightTimeline?.copy(
                                                     musicVolume = volume.coerceIn(0f, 1f)
                                                 )
                                                 isEffectPreviewApplied = false
                                             },
-                                            onKillSoundEnabledChanged = { enabled ->
-                                                highlightTimeline = highlightTimeline?.copy(enableKillSound = enabled)
+                                            onMusicRangeChanged = { start, end ->
+                                                highlightTimeline = highlightTimeline?.copy(
+                                                    musicStartMs = start.coerceAtLeast(0L),
+                                                    musicEndMs = end.coerceAtLeast(start)
+                                                )
                                                 isEffectPreviewApplied = false
                                             },
-                                            onKillSoundVolumeChanged = { volume ->
+                                            onMusicMutedChanged = { muted ->
+                                                highlightTimeline = highlightTimeline?.copy(musicMuted = muted)
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onGameAudioMutedChanged = { muted ->
+                                                gameAudioMuted = muted
+                                                highlightTimeline = highlightTimeline?.copy(gameAudioMuted = muted)
+                                                isEffectPreviewApplied = false
+                                            },
+                                            onMusicFadesChanged = { fadeIn, fadeOut ->
                                                 highlightTimeline = highlightTimeline?.copy(
-                                                    killSoundVolume = volume.coerceIn(0f, 1f)
+                                                    musicFadeInMs = fadeIn.coerceAtLeast(0L),
+                                                    musicFadeOutMs = fadeOut.coerceAtLeast(0L)
                                                 )
                                                 isEffectPreviewApplied = false
                                             },

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.horizontalScroll
@@ -70,6 +71,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
@@ -854,19 +856,22 @@ fun VideoPreview(
     previewSeekMs: Long = startMs,
     onPositionChanged: (Long) -> Unit = {},
     previewRequestId: Int = 0,
+    playRequestId: Int = 0,
     autoPlay: Boolean = false,
+    audioMuted: Boolean = false,
+    enableDoubleTapSeek: Boolean = false,
+    liveTrimAdjustment: Boolean = false,
     showPlaybackControls: Boolean = true,
     previewMaxHeight: Dp = 640.dp
 ) {
     val context = LocalContext.current
     val currentOnDurationChanged by rememberUpdatedState(onDurationChanged)
     val currentOnPositionChanged by rememberUpdatedState(onPositionChanged)
+    val currentStartMs by rememberUpdatedState(startMs)
+    val currentEndMs by rememberUpdatedState(endMs)
     var positionMs by remember(videoUri) { mutableLongStateOf(startMs) }
-    val player = remember(videoUri, videoEffects) {
+    val player = remember(videoUri) {
         ExoPlayer.Builder(context).build().apply {
-            if (videoEffects.isNotEmpty()) {
-                setVideoEffects(videoEffects)
-            }
             setMediaItem(MediaItem.fromUri(Uri.parse(videoUri)))
             prepare()
             if (positionMs > 0L) {
@@ -910,15 +915,15 @@ fun VideoPreview(
 
     LaunchedEffect(
         player,
-        startMs,
-        endMs,
+        if (liveTrimAdjustment) 0L else startMs,
+        if (liveTrimAdjustment) 0L else endMs,
         speedProvider
     ) {
         if (
-            endMs > startMs &&
-            (player.currentPosition < startMs || player.currentPosition >= endMs)
+            !liveTrimAdjustment && currentEndMs > currentStartMs &&
+            (player.currentPosition < currentStartMs || player.currentPosition >= currentEndMs)
         ) {
-            player.seekTo(startMs)
+            player.seekTo(currentStartMs)
         }
         while (true) {
             positionMs = player.currentPosition.coerceAtLeast(0L)
@@ -928,9 +933,9 @@ fun VideoPreview(
                 durationMs = playerDuration
                 currentOnDurationChanged(playerDuration)
             }
-            if (endMs > startMs && playing && positionMs >= endMs) {
+            if (currentEndMs > currentStartMs && playing && positionMs >= currentEndMs) {
                 player.pause()
-                player.seekTo(startMs)
+                player.seekTo(currentStartMs)
             }
             val desiredSpeed = speedProvider?.getSpeed(positionMs * 1_000L) ?: 1f
             if (kotlin.math.abs(desiredSpeed - appliedPlaybackSpeed) > 0.02f) {
@@ -943,14 +948,36 @@ fun VideoPreview(
 
     LaunchedEffect(player, previewRequestId, showPlaybackControls) {
         if (previewRequestId > 0) {
-            if (!showPlaybackControls) player.pause()
-            player.seekTo(previewSeekMs.coerceIn(startMs, endMs))
-            if (showPlaybackControls) player.play()
+            player.pause()
+            val targetMs = previewSeekMs.coerceIn(startMs, endMs)
+            player.seekTo(targetMs)
+            positionMs = targetMs
+            currentOnPositionChanged(targetMs)
+            playing = false
+        }
+    }
+
+    LaunchedEffect(player, playRequestId) {
+        if (playRequestId > 0) {
+            val targetMs = previewSeekMs.coerceIn(startMs, endMs)
+            player.seekTo(targetMs)
+            positionMs = targetMs
+            currentOnPositionChanged(targetMs)
+            playing = true
+            player.play()
         }
     }
 
     LaunchedEffect(player, autoPlay) {
         playing = autoPlay
+    }
+
+    LaunchedEffect(player, audioMuted) {
+        player.volume = if (audioMuted) 0f else 1f
+    }
+
+    LaunchedEffect(player, videoEffects) {
+        player.setVideoEffects(videoEffects)
     }
 
     LaunchedEffect(playing, player) {
@@ -988,12 +1015,43 @@ fun VideoPreview(
                         },
                         update = { it.player = player }
                     )
+                    if (enableDoubleTapSeek) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .fillMaxHeight()
+                                .fillMaxWidth(0.5f)
+                                .pointerInput(player, startMs, endMs) {
+                                    detectTapGestures(onDoubleTap = {
+                                        val targetMs = (player.currentPosition - 10_000L).coerceIn(startMs, endMs)
+                                        player.seekTo(targetMs)
+                                        positionMs = targetMs
+                                        currentOnPositionChanged(targetMs)
+                                    })
+                                }
+                        )
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .fillMaxHeight()
+                                .fillMaxWidth(0.5f)
+                                .pointerInput(player, startMs, endMs) {
+                                    detectTapGestures(onDoubleTap = {
+                                        val targetMs = (player.currentPosition + 10_000L).coerceIn(startMs, endMs)
+                                        player.seekTo(targetMs)
+                                        positionMs = targetMs
+                                        currentOnPositionChanged(targetMs)
+                                    })
+                                }
+                        )
+                    }
                     if (showPlaybackControls && !playing) {
                         IconButton(
                             onClick = {
                                 if (player.currentPosition < startMs || player.currentPosition >= endMs) {
                                     player.seekTo(startMs)
                                 }
+                                playing = true
                                 player.play()
                             },
                             modifier = Modifier.align(Alignment.Center)
@@ -1021,7 +1079,12 @@ fun VideoPreview(
                         sliderStartMs.toFloat(),
                         sliderEndMs.toFloat()
                     ),
-                    onValueChange = { player.seekTo(it.roundToLong()) },
+                    onValueChange = {
+                        val targetMs = it.roundToLong()
+                        player.seekTo(targetMs)
+                        positionMs = targetMs
+                        currentOnPositionChanged(targetMs)
+                    },
                     valueRange = sliderStartMs.toFloat()..sliderEndMs.toFloat(),
                     modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
                 )
@@ -1029,11 +1092,13 @@ fun VideoPreview(
                 IconButton(
                     onClick = {
                         if (playing) {
+                            playing = false
                             player.pause()
                         } else {
                             if (player.currentPosition < startMs || player.currentPosition >= endMs) {
                                 player.seekTo(startMs)
                             }
+                            playing = true
                             player.play()
                         }
                     }

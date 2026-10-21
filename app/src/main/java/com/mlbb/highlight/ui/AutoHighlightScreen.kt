@@ -27,6 +27,8 @@ import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -70,8 +72,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import com.mlbb.highlight.highlight.EffectIntensity
 import com.mlbb.highlight.highlight.EffectPreset
+import com.mlbb.highlight.highlight.EffectIntensity
 import com.mlbb.highlight.highlight.HighlightAspectRatio
 import com.mlbb.highlight.highlight.HighlightClip
 import com.mlbb.highlight.highlight.HighlightEvent
@@ -81,7 +83,6 @@ import com.mlbb.highlight.highlight.HighlightStyle
 import com.mlbb.highlight.highlight.HighlightTimeline
 import com.mlbb.highlight.highlight.AutoHighlightEngine
 import com.mlbb.highlight.highlight.buildHighlightSpeedProvider
-import com.mlbb.highlight.highlight.withEventTimingOffset
 import com.mlbb.highlight.detection.HudRegion
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -97,6 +98,7 @@ fun AutoHighlightScreen(
     onPickVideo: () -> Unit,
     onTrimChanged: (Long, Long) -> Unit,
     timeline: HighlightTimeline?,
+    gameAudioMuted: Boolean,
     detectedEvents: List<HighlightEvent>,
     scanResult: AutoHighlightEngine.HighlightScanResult?,
     scanProgress: AutoHighlightEngine.KdaScanProgress?,
@@ -113,14 +115,18 @@ fun AutoHighlightScreen(
     onAcceptReview: (AutoHighlightEngine.HighlightReview) -> Unit,
     onDismissReview: (String) -> Unit,
     onClipChanged: (HighlightClip) -> Unit,
+    onClipMoved: (String, Int) -> Unit,
     onApplyEffectToAll: (EffectPreset) -> Unit,
     onClipRemoved: (HighlightClip) -> Unit,
     onAspectRatioChanged: (HighlightAspectRatio) -> Unit,
     onResolutionChanged: (HighlightResolution) -> Unit,
     onChooseMusic: () -> Unit,
+    onRemoveMusic: () -> Unit,
     onMusicVolumeChanged: (Float) -> Unit,
-    onKillSoundEnabledChanged: (Boolean) -> Unit,
-    onKillSoundVolumeChanged: (Float) -> Unit,
+    onMusicRangeChanged: (Long, Long) -> Unit,
+    onMusicMutedChanged: (Boolean) -> Unit,
+    onGameAudioMutedChanged: (Boolean) -> Unit,
+    onMusicFadesChanged: (Long, Long) -> Unit,
     onPreview: () -> Unit,
     onExport: () -> Unit,
     onBack: () -> Unit
@@ -130,9 +136,12 @@ fun AutoHighlightScreen(
         mutableStateOf(timeline?.clips?.firstOrNull()?.id.orEmpty())
     }
     var playheadMs by remember(videoUri) { mutableLongStateOf(trimStartMs) }
-    var showAdvanced by rememberSaveable(selectedClipId) { mutableStateOf(false) }
     var showDetectionDebug by rememberSaveable { mutableStateOf(false) }
+    var showMomentPicker by rememberSaveable(selectedClipId) { mutableStateOf(false) }
     val selectedClip = timeline?.clips?.firstOrNull { it.id == selectedClipId }
+    var seekRequestId by remember(videoUri) { mutableIntStateOf(0) }
+    var playRequestId by remember(videoUri) { mutableIntStateOf(0) }
+    val timelineScrollState = remember(videoUri) { androidx.compose.foundation.ScrollState(0) }
     val trimDurationMs = (trimEndMs - trimStartMs).coerceAtLeast(0L)
     val effectiveTimeline = timeline?.takeIf {
         it.sourceUri == videoUri &&
@@ -166,16 +175,14 @@ fun AutoHighlightScreen(
     val selectedPreviewStartMs = selectedClip?.let { trimStartMs + it.startMs } ?: trimStartMs
     val selectedPreviewEndMs = selectedClip?.let { trimStartMs + it.endMs } ?: trimEndMs
 
-    var activeStep by rememberSaveable { mutableStateOf("Video") }
-    val steps = listOf("Video", "Highlights", "Effects", "Music", "Export")
+    var activeStep by rememberSaveable(videoUri) { mutableStateOf("Trim") }
+    val steps = listOf("Trim", "Highlights", "Moments", "Music", "Export")
     val previewStart = when {
-        activeStep == "Video" -> 0L
-        activeStep == "Effects" && selectedClip != null -> trimStartMs + selectedClip.startMs
+        activeStep == "Moments" && selectedClip != null -> trimStartMs + selectedClip.startMs
         else -> trimStartMs
     }
     val previewEnd = when {
-        activeStep == "Video" -> sourceDurationMs.coerceAtLeast(trimEndMs)
-        activeStep == "Effects" && selectedClip != null -> trimStartMs + selectedClip.endMs
+        activeStep == "Moments" && selectedClip != null -> trimStartMs + selectedClip.endMs
         else -> trimEndMs
     }
 
@@ -183,7 +190,7 @@ fun AutoHighlightScreen(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        EditorScreenHeader(title = "Auto Highlight", onBack = onBack)
+        EditorScreenHeader(title = "Moments", onBack = onBack)
         if (videoUri == null) {
             EmptyEditorCard(
                 title = "Choose a gameplay video",
@@ -217,14 +224,20 @@ fun AutoHighlightScreen(
                 onDurationChanged = {},
                 videoEffects = previewPipeline.videoEffects,
                 speedProvider = previewSpeedProvider,
-                previewSeekMs = if (activeStep == "Video") trimStartMs
+                previewSeekMs = if (activeStep == "Trim") trimStartMs
+                    else if (activeStep == "Moments") playheadMs
                     else selectedClip?.let { trimStartMs + it.eventTimeMs } ?: trimStartMs,
                 onPositionChanged = { playheadMs = it },
-                previewMaxHeight = 280.dp
+                previewRequestId = seekRequestId,
+                playRequestId = playRequestId,
+                audioMuted = gameAudioMuted,
+                enableDoubleTapSeek = activeStep == "Trim",
+                liveTrimAdjustment = activeStep == "Trim",
+                previewMaxHeight = if (activeStep == "Moments") 220.dp else 280.dp
             )
 
             when (activeStep) {
-                "Video" -> {
+                "Trim" -> {
                     Text("Trim video", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
                     VideoTimeline(
                         context = androidx.compose.ui.platform.LocalContext.current,
@@ -259,7 +272,7 @@ fun AutoHighlightScreen(
                         ) { Text("Set end") }
                     }
                     Text(
-                        "Choose the match range first. Playback controls are directly below the preview.",
+                        "Double-tap the left or right side of the preview to seek by 10 seconds.",
                         color = RecorderTheme.textSecondary,
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -267,12 +280,12 @@ fun AutoHighlightScreen(
                 "Highlights" -> {
                     Text("Find and review moments", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Cinematic is applied automatically. Fine-tune speed and shake under Effects → Advanced settings.",
+                        "Classic is applied by default. Adjust slow motion and shake for each moment.",
                         color = RecorderTheme.textSecondary,
                         style = MaterialTheme.typography.bodySmall
                     )
                     Button(
-                        onClick = { onAnalyze(HighlightStyle.CINEMATIC) },
+                        onClick = { onAnalyze(HighlightStyle.CLASSIC) },
                         enabled = !isAnalyzing && !isExporting,
                         modifier = Modifier.fillMaxWidth().height(48.dp)
                     ) {
@@ -297,7 +310,11 @@ fun AutoHighlightScreen(
                         playheadMs = (playheadMs - trimStartMs).coerceIn(0L, trimDurationMs)
                     )
                     Text(
-                        if (detectedEvents.isEmpty()) "No personal kill increase detected yet. Play to a moment and mark it manually."
+                        if (detectedEvents.isEmpty() && scanResult?.reviewDetections?.isNotEmpty() == true) {
+                            "No confirmed kills yet. Review the uncertain HUD increase above or mark a moment manually."
+                        } else if (detectedEvents.isEmpty()) {
+                            "No confirmed kill increase detected in the selected trim. Play to a moment and mark it manually."
+                        }
                         else "${detectedEvents.count { it.origin == HighlightEventOrigin.OCR }} OCR moments · ${detectedEvents.count { it.origin == HighlightEventOrigin.MANUAL }} manual marks",
                         color = RecorderTheme.textSecondary,
                         style = MaterialTheme.typography.bodySmall
@@ -308,25 +325,104 @@ fun AutoHighlightScreen(
                         modifier = Modifier.fillMaxWidth().height(48.dp)
                     ) { Text("Add moment at ${formatEditorTime(playheadMs)}") }
                 }
-                "Effects" -> {
-                    Text("Choose a moment to edit", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
+                "Moments" -> {
                     if (timeline?.clips?.isNotEmpty() == true && timeline.sourceUri == videoUri) {
-                        Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            timeline.clips.forEach { clip ->
-                                FilterChip(selected = clip.id == selectedClipId,
-                                    onClick = { selectedClipId = clip.id },
-                                    label = { Text("${clip.label} · ${formatEditorTime(clip.eventTimeMs)}") })
+                        val timelineOutputMs = mapSourceToOutputPosition(
+                            clips = timeline.clips,
+                            sourcePositionMs = playheadMs - trimStartMs,
+                            selectedClip = selectedClip
+                        )
+                        Box {
+                            OutlinedButton(
+                                onClick = { showMomentPicker = true },
+                                modifier = Modifier.fillMaxWidth().height(38.dp)
+                            ) {
+                                Text(
+                                    selectedClip?.let { clip ->
+                                        "Edit moment · ${formatEditorTime(trimStartMs + clip.eventTimeMs)}"
+                                    } ?: "Choose moment to edit"
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = showMomentPicker,
+                                onDismissRequest = { showMomentPicker = false }
+                            ) {
+                                timeline.clips.forEachIndexed { index, clip ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text("${index + 1} · ${clip.label} · ${formatEditorTime(trimStartMs + clip.eventTimeMs)}")
+                                        },
+                                        onClick = {
+                                            selectedClipId = clip.id
+                                            playheadMs = trimStartMs + clip.eventTimeMs
+                                            seekRequestId += 1
+                                            showMomentPicker = false
+                                        }
+                                    )
+                                }
                             }
                         }
+                        MomentsTimeline(
+                            clips = timeline.clips,
+                            sourceDurationMs = trimDurationMs,
+                            selectedClipId = selectedClipId,
+                            musicUri = timeline.musicUri,
+                            musicStartMs = timeline.musicStartMs,
+                            musicEndMs = timeline.musicEndMs,
+                            outputPositionMs = timelineOutputMs,
+                            scrollState = timelineScrollState,
+                            onSelectClip = { clip ->
+                                selectedClipId = clip.id
+                                playheadMs = trimStartMs + clip.eventTimeMs
+                                seekRequestId += 1
+                            },
+                            onSeekOutput = { outputMs ->
+                                val destination = mapOutputToSourcePosition(timeline.clips, outputMs)
+                                playheadMs = trimStartMs + destination
+                                selectedClipId = timeline.clips.firstOrNull { destination in it.startMs..it.endMs }?.id
+                                    ?: selectedClipId
+                                seekRequestId += 1
+                            },
+                            onClipChanged = onClipChanged,
+                            onFxTimingChanged = { changed ->
+                                onClipChanged(changed)
+                                selectedClipId = changed.id
+                                playheadMs = trimStartMs + changed.eventTimeMs
+                            },
+                            onMoveClip = onClipMoved,
+                            onMusicRangeChanged = onMusicRangeChanged,
+                            gameAudioMuted = gameAudioMuted,
+                            onGameAudioMutedChanged = onGameAudioMutedChanged
+                        )
                         if (selectedClip != null) {
+                            val slowMotionActive =
+                                selectedClip.effectPreset.videoPreset == VideoEffectPreset.KILL_SLOWMO &&
+                                    selectedClip.effectPreset.slowMotionSpeed < 0.99f
+                            val effectStartMs = if (slowMotionActive) {
+                                (selectedClip.eventTimeMs -
+                                    (200f * selectedClip.effectPreset.slowMotionSpeed.coerceIn(0.25f, 0.9f)).toLong())
+                                    .coerceAtLeast(selectedClip.startMs)
+                            } else selectedClip.eventTimeMs
+                            val effectEndMs = (selectedClip.eventTimeMs +
+                                if (slowMotionActive) {
+                                    (800f * selectedClip.effectPreset.slowMotionSpeed.coerceIn(0.25f, 0.9f)).toLong()
+                                } else 350L
+                            ).coerceAtMost(selectedClip.endMs)
+                            Text(
+                                "Effect time frame · ${formatEditorTimeWithTenths(trimStartMs + effectStartMs)}–" +
+                                    formatEditorTimeWithTenths(trimStartMs + effectEndMs) +
+                                    if (slowMotionActive) " · 1.0s slow-mo" else "",
+                                color = RecorderTheme.cyan,
+                                style = MaterialTheme.typography.bodySmall
+                            )
                             ClipEditor(
                                 clip = selectedClip,
-                                maxDurationMs = trimDurationMs,
-                                advanced = showAdvanced,
-                                onAdvancedChanged = { showAdvanced = it },
+                                playheadMs = playheadMs,
                                 onClipChanged = onClipChanged,
-                                onApplyEffectToAll = onApplyEffectToAll,
+                                onPreviewEffect = { eventTimeMs ->
+                                    playheadMs = trimStartMs + eventTimeMs
+                                    playRequestId += 1
+                                },
                                 onClipRemoved = {
                                     onClipRemoved(selectedClip)
                                     selectedClipId = timeline.clips.firstOrNull { it.id != selectedClip.id }?.id.orEmpty()
@@ -335,7 +431,7 @@ fun AutoHighlightScreen(
                             Text("Current effect · ${selectedClip.effectPreset.name}", color = RecorderTheme.cyan)
                         }
                     } else {
-                        Text("Scan for highlights or add a moment manually before editing effects.",
+                        Text("Scan for highlights or add a moment manually to build the timeline.",
                             color = RecorderTheme.textSecondary)
                     }
                 }
@@ -354,17 +450,34 @@ fun AutoHighlightScreen(
                             Text(if (currentTimeline.musicUri == null) "Choose music" else "Change music")
                         }
                         if (currentTimeline.musicUri != null) {
+                            OutlinedButton(onClick = onRemoveMusic, modifier = Modifier.fillMaxWidth()) {
+                                Text("Remove music")
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Mute background music", modifier = Modifier.weight(1f), color = RecorderTheme.textPrimary)
+                                androidx.compose.material3.Switch(
+                                    checked = currentTimeline.musicMuted,
+                                    onCheckedChange = onMusicMutedChanged
+                                )
+                            }
                             Text("Music volume · ${(currentTimeline.musicVolume * 100f).roundToInt()}%", color = RecorderTheme.textSecondary)
                             Slider(value = currentTimeline.musicVolume, onValueChange = onMusicVolumeChanged, valueRange = 0f..1f)
-                        }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Kill sound", modifier = Modifier.weight(1f), color = RecorderTheme.textPrimary)
-                            androidx.compose.material3.Switch(checked = currentTimeline.enableKillSound,
-                                onCheckedChange = onKillSoundEnabledChanged)
-                        }
-                        if (currentTimeline.enableKillSound) {
-                            Text("Kill sound volume · ${(currentTimeline.killSoundVolume * 100f).roundToInt()}%", color = RecorderTheme.textSecondary)
-                            Slider(value = currentTimeline.killSoundVolume, onValueChange = onKillSoundVolumeChanged, valueRange = 0f..1f)
+                            val duration = currentTimeline.durationMs
+                            val musicStart = currentTimeline.musicStartMs.coerceIn(0L, duration)
+                            val musicEnd = (currentTimeline.musicEndMs ?: duration).coerceIn(musicStart, duration)
+                            Text("Music range · ${formatEditorTime(musicStart)}–${formatEditorTime(musicEnd)}", color = RecorderTheme.textSecondary)
+                            Text("Fade in · ${(currentTimeline.musicFadeInMs / 1_000f).toInt()}s", color = RecorderTheme.textSecondary)
+                            Slider(
+                                value = currentTimeline.musicFadeInMs.toFloat().coerceIn(0f, duration.toFloat()),
+                                onValueChange = { fade -> onMusicFadesChanged(fade.roundToLong(), currentTimeline.musicFadeOutMs) },
+                                valueRange = 0f..duration.coerceAtLeast(1L).toFloat()
+                            )
+                            Text("Fade out · ${(currentTimeline.musicFadeOutMs / 1_000f).toInt()}s", color = RecorderTheme.textSecondary)
+                            Slider(
+                                value = currentTimeline.musicFadeOutMs.toFloat().coerceIn(0f, duration.toFloat()),
+                                onValueChange = { fade -> onMusicFadesChanged(currentTimeline.musicFadeInMs, fade.roundToLong()) },
+                                valueRange = 0f..duration.coerceAtLeast(1L).toFloat()
+                            )
                         }
                     }
                 }
@@ -414,18 +527,6 @@ fun AutoHighlightScreen(
                         Text(if (showDetectionDebug) "Hide detection details" else "Show detection details")
                     }
                     if (showDetectionDebug) KdaDetectionDebug(scanResult)
-                    if (selectedClip != null) {
-                        Text("Effect timing · ${formatSignedSeconds(selectedClip.eventTimeMs - selectedClip.detectedEventTimeMs)} from detected point",
-                            color = RecorderTheme.textSecondary)
-                        Slider(
-                            value = ((selectedClip.eventTimeMs - selectedClip.detectedEventTimeMs) / 1_000f).coerceIn(-2f, 2f),
-                            onValueChange = { seconds -> onClipChanged(selectedClip.withEventTimingOffset((seconds * 1_000f).roundToLong())) },
-                            valueRange = -2f..2f,
-                            steps = 15
-                        )
-                    }
-                    Text("Detection confidence rules are fixed in the detector; configurable thresholds are not currently available.",
-                        color = RecorderTheme.textSecondary, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
@@ -434,9 +535,35 @@ fun AutoHighlightScreen(
     }
 }
 
-private fun formatSignedSeconds(milliseconds: Long): String {
-    val seconds = milliseconds / 1_000f
-    return "${if (seconds > 0f) "+" else ""}${"%.2f".format(seconds)}s"
+private fun mapSourceToOutputPosition(
+    clips: List<HighlightClip>,
+    sourcePositionMs: Long,
+    selectedClip: HighlightClip?
+): Long {
+    var outputPosition = 0L
+    clips.forEach { clip ->
+        if (sourcePositionMs in clip.startMs..clip.endMs) {
+            return outputPosition + (sourcePositionMs - clip.startMs).coerceAtMost(clip.durationMs)
+        }
+        outputPosition += clip.durationMs
+    }
+    return selectedClip?.let { clip ->
+        var start = 0L
+        clips.takeWhile { it.id != clip.id }.forEach { start += it.durationMs }
+        start + (clip.eventTimeMs - clip.startMs).coerceIn(0L, clip.durationMs)
+    } ?: 0L
+}
+
+private fun mapOutputToSourcePosition(clips: List<HighlightClip>, outputPositionMs: Long): Long {
+    var cursor = 0L
+    clips.forEach { clip ->
+        val end = cursor + clip.durationMs
+        if (outputPositionMs <= end) {
+            return clip.startMs + (outputPositionMs - cursor).coerceIn(0L, clip.durationMs)
+        }
+        cursor = end
+    }
+    return clips.lastOrNull()?.endMs ?: 0L
 }
 
 @Composable
@@ -1096,17 +1223,17 @@ private fun KdaTrackerDiagnostics(
 private fun formatKda(snapshot: com.mlbb.highlight.detection.KdaSnapshot): String =
     "${snapshot.kills} / ${snapshot.deaths} / ${snapshot.assists}"
 
+private fun formatEditorTimeWithTenths(milliseconds: Long): String =
+    "${formatEditorTime(milliseconds)}.${(milliseconds.coerceAtLeast(0L) % 1_000L) / 100L}"
+
 @Composable
 private fun ClipEditor(
     clip: HighlightClip,
-    maxDurationMs: Long,
-    advanced: Boolean,
-    onAdvancedChanged: (Boolean) -> Unit,
+    playheadMs: Long,
     onClipChanged: (HighlightClip) -> Unit,
-    onApplyEffectToAll: (EffectPreset) -> Unit,
+    onPreviewEffect: (Long) -> Unit,
     onClipRemoved: () -> Unit
 ) {
-    val eventTimeInClip = (clip.eventTimeMs - clip.startMs).coerceIn(0L, clip.durationMs)
     Card(
         colors = CardDefaults.cardColors(containerColor = RecorderTheme.surface),
         shape = RoundedCornerShape(18.dp)
@@ -1117,175 +1244,48 @@ private fun ClipEditor(
         ) {
             Text("Edit moment", color = RecorderTheme.textPrimary, fontWeight = FontWeight.SemiBold)
             Text(
-                "Start · ${formatEditorTime(clip.startMs)}",
+                "Drag the clip edges in the timeline to trim · ${formatEditorTime(clip.startMs)}–${formatEditorTime(clip.endMs)}",
+                color = RecorderTheme.textSecondary,
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text("Selected time · ${formatEditorTime(playheadMs)}", color = RecorderTheme.textSecondary)
+            Text("Tap the FX track or drag its marker to set effect timing.",
+                color = RecorderTheme.textSecondary, style = MaterialTheme.typography.bodySmall)
+            Text(
+                "Slow motion · ${(clip.effectPreset.slowMotionSpeed * 100f).roundToInt()}%",
                 color = RecorderTheme.textSecondary
             )
             Slider(
-                value = clip.startMs.toFloat(),
-                onValueChange = { value ->
-                    val newStart = value.roundToLong()
-                        .coerceIn(0L, (clip.endMs - MIN_CLIP_DURATION_MS).coerceAtLeast(0L))
-                    onClipChanged(
-                        clip.copy(
-                            startMs = newStart,
-                            speedCurve = clip.speedCurve.copy(
-                                points = clip.speedCurve.points.map { point ->
-                                    point.copy(
-                                        timeMs = (point.timeMs + clip.startMs - newStart)
-                                            .coerceIn(0L, clip.endMs - newStart)
-                                    )
-                                }
-                            )
-                        )
-                    )
+                value = clip.effectPreset.slowMotionSpeed.coerceIn(0.25f, 1f),
+                onValueChange = { speed ->
+                    onClipChanged(clip.copy(effectPreset = clip.effectPreset.copy(
+                        name = "Classic",
+                        videoPreset = if (speed >= 0.99f) VideoEffectPreset.KILL_IMPACT else VideoEffectPreset.KILL_SLOWMO,
+                        intensity = EffectIntensity.HIGH,
+                        slowMotionSpeed = speed
+                    )))
                 },
-                valueRange = 0f..maxDurationMs.coerceAtLeast(1L).toFloat()
+                onValueChangeFinished = { onPreviewEffect(clip.eventTimeMs) },
+                valueRange = 0.25f..1f
             )
             Text(
-                "End · ${formatEditorTime(clip.endMs)}",
+                "Shake · ${(clip.effectPreset.shakeAmount * 100f).roundToInt()}%",
                 color = RecorderTheme.textSecondary
             )
             Slider(
-                value = clip.endMs.toFloat(),
-                onValueChange = { value ->
-                    val newEnd = value.roundToLong()
-                        .coerceIn(
-                            (clip.startMs + MIN_CLIP_DURATION_MS).coerceAtMost(maxDurationMs),
-                            maxDurationMs
-                        )
-                    onClipChanged(
-                        clip.copy(
-                            endMs = newEnd,
-                            speedCurve = clip.speedCurve.copy(
-                                points = clip.speedCurve.points.map { point ->
-                                    point.copy(
-                                        timeMs = point.timeMs.coerceIn(
-                                            0L,
-                                            newEnd - clip.startMs
-                                        )
-                                    )
-                                }
-                            )
-                        )
-                    )
+                value = clip.effectPreset.shakeAmount.coerceIn(0f, 1f),
+                onValueChange = { shake ->
+                    onClipChanged(clip.copy(effectPreset = clip.effectPreset.copy(
+                        name = "Classic",
+                        videoPreset = if (clip.effectPreset.slowMotionSpeed >= 0.99f) {
+                            VideoEffectPreset.KILL_IMPACT
+                        } else VideoEffectPreset.KILL_SLOWMO,
+                        intensity = EffectIntensity.HIGH,
+                        shakeAmount = shake
+                    )))
                 },
-                valueRange = 0f..maxDurationMs.coerceAtLeast(1L).toFloat()
+                valueRange = 0f..1f
             )
-            Text("Effect intensity", color = RecorderTheme.textSecondary)
-            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                listOf(
-                    "Kill" to VideoEffectPreset.KILL_IMPACT,
-                    "Slow-mo" to VideoEffectPreset.KILL_SLOWMO,
-                    "Savage" to VideoEffectPreset.SAVAGE,
-                    "Original" to VideoEffectPreset.NONE
-                ).forEach { (label, preset) ->
-                    FilterChip(
-                        selected = clip.effectPreset.videoPreset == preset,
-                        onClick = {
-                            val intensity = when {
-                                preset == VideoEffectPreset.NONE -> EffectIntensity.OFF
-                                clip.effectPreset.intensity == EffectIntensity.OFF -> EffectIntensity.MEDIUM
-                                else -> clip.effectPreset.intensity
-                            }
-                            onClipChanged(
-                                clip.copy(
-                                    effectPreset = clip.effectPreset.copy(
-                                        name = if (preset == VideoEffectPreset.NONE) {
-                                            "Original"
-                                        } else {
-                                            "MLBB Cinematic Kill"
-                                        },
-                                        videoPreset = preset,
-                                        intensity = intensity
-                                    )
-                                )
-                            )
-                        },
-                        label = { Text(label) }
-                    )
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                EffectIntensity.entries.forEach { intensity ->
-                    FilterChip(
-                        selected = clip.effectPreset.intensity == intensity,
-                        onClick = {
-                            onClipChanged(
-                                clip.copy(
-                                    effectPreset = clip.effectPreset.copy(intensity = intensity)
-                                )
-                            )
-                        },
-                        label = { Text(intensity.label) }
-                    )
-                }
-            }
-            OutlinedButton(
-                onClick = { onApplyEffectToAll(clip.effectPreset) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Apply effect to all moments")
-            }
-            OutlinedButton(
-                onClick = { onAdvancedChanged(!advanced) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (advanced) "Hide advanced settings" else "Advanced settings")
-            }
-            if (advanced) {
-                Text("Speed curve", color = RecorderTheme.textSecondary)
-                SpeedCurveEditor(
-                    clip = clip,
-                    eventTimeMs = eventTimeInClip,
-                    onSpeedChanged = { speed, curve ->
-                        onClipChanged(
-                            clip.copy(
-                                effectPreset = clip.effectPreset.copy(slowMotionSpeed = speed),
-                                speedCurve = curve
-                            )
-                        )
-                    }
-                )
-                Text(
-                    "Impact speed · ${(clip.effectPreset.slowMotionSpeed * 100f).roundToInt()}%",
-                    color = RecorderTheme.textSecondary
-                )
-                Slider(
-                    value = clip.effectPreset.slowMotionSpeed,
-                    onValueChange = { speed ->
-                        val curve = clip.speedCurve.copy(
-                            points = clip.speedCurve.points.map { it.copy() }.let { points ->
-                                val closestIndex = points.indices.minByOrNull { index ->
-                                    kotlin.math.abs(points[index].timeMs - eventTimeInClip)
-                                }
-                                points.mapIndexed { index, point ->
-                                    if (index == closestIndex) point.copy(speed = speed) else point
-                                }
-                            }
-                        )
-                        onClipChanged(
-                            clip.copy(
-                                effectPreset = clip.effectPreset.copy(slowMotionSpeed = speed),
-                                speedCurve = curve
-                            )
-                        )
-                    },
-                    valueRange = 0.25f..1.5f
-                )
-                Text(
-                    "Shake · ${(clip.effectPreset.shakeAmount * 100f).roundToInt()}%",
-                    color = RecorderTheme.textSecondary
-                )
-                Slider(
-                    value = clip.effectPreset.shakeAmount,
-                    onValueChange = { shake ->
-                        onClipChanged(
-                            clip.copy(effectPreset = clip.effectPreset.copy(shakeAmount = shake))
-                        )
-                    },
-                    valueRange = 0f..1f
-                )
-            }
             OutlinedButton(onClick = onClipRemoved, modifier = Modifier.fillMaxWidth()) {
                 Text("Remove moment")
             }
@@ -1368,5 +1368,3 @@ private fun SpeedCurveEditor(
         style = MaterialTheme.typography.bodySmall
     )
 }
-
-private const val MIN_CLIP_DURATION_MS = 500L

@@ -89,7 +89,7 @@ data class EffectPreset(
                 VideoEffectPreset.SAVAGE
             ),
             zoomScale = (1f + zoomAmount * level).coerceIn(1f, 1.2f),
-            shakeAmount = (shakeAmount * level).coerceIn(0f, 1f)
+            shakeAmount = shakeAmount.coerceIn(0f, 1f)
         )
     }
 }
@@ -135,13 +135,6 @@ data class SpeedCurve(
     }
 }
 
-data class AudioCue(
-    val type: String,
-    val timeMs: Long,
-    val assetUri: String? = null,
-    val volume: Float = 1f
-)
-
 enum class TextPosition {
     TOP,
     CENTER,
@@ -164,7 +157,6 @@ data class HighlightClip(
     val events: List<HighlightEvent>,
     val effectPreset: EffectPreset,
     val speedCurve: SpeedCurve,
-    val audioCues: List<AudioCue> = emptyList(),
     val textOverlay: TextOverlay? = null,
     /** Original detected time, retained so timing adjustments stay relative to analysis. */
     val detectedEventTimeMs: Long = eventTimeMs
@@ -185,7 +177,10 @@ fun HighlightClip.withEventTimingOffset(offsetMs: Long): HighlightClip {
             point.copy(timeMs = (point.timeMs + deltaMs).coerceIn(0L, durationMs))
         }.distinctBy { it.timeMs }.sortedBy { it.timeMs }
     )
-    return copy(eventTimeMs = adjustedEventTimeMs, speedCurve = adjustedSpeedCurve)
+    return copy(
+        eventTimeMs = adjustedEventTimeMs,
+        speedCurve = adjustedSpeedCurve
+    )
 }
 
 data class HighlightTimeline(
@@ -198,11 +193,15 @@ data class HighlightTimeline(
     val resolution: HighlightResolution = HighlightResolution.P1080,
     val musicUri: String? = null,
     val musicVolume: Float = 0.13f,
-    val killSoundVolume: Float = 0.65f,
+    val musicStartMs: Long = 0L,
+    val musicEndMs: Long? = null,
+    val musicFadeInMs: Long = 0L,
+    val musicFadeOutMs: Long = 0L,
+    val musicMuted: Boolean = false,
+    val gameAudioMuted: Boolean = false,
     val enableScreenShake: Boolean = true,
     val enableSlowMotion: Boolean = true,
     val enableImpactFlash: Boolean = true,
-    val enableKillSound: Boolean = true,
     val enableBackgroundMusic: Boolean = false,
     val preserveOriginalGameplay: Boolean = true
 ) {
@@ -214,24 +213,11 @@ data class HighlightTimeline(
 }
 
 fun HighlightEventType.effectPreset(style: HighlightStyle): EffectPreset {
-    val selectedPreset = when {
-        this == HighlightEventType.SAVAGE -> VideoEffectPreset.SAVAGE
-        style == HighlightStyle.CLEAN -> VideoEffectPreset.KILL_IMPACT
-        style == HighlightStyle.CINEMATIC -> VideoEffectPreset.KILL_SLOWMO
-        style == HighlightStyle.AGGRESSIVE -> VideoEffectPreset.KILL_IMPACT
-        else -> VideoEffectPreset.KILL_IMPACT
-    }
-    val intensity = when (style) {
-        HighlightStyle.CLEAN -> EffectIntensity.LOW
-        HighlightStyle.AGGRESSIVE -> EffectIntensity.HIGH
-        HighlightStyle.CINEMATIC,
-        HighlightStyle.CLASSIC -> EffectIntensity.MEDIUM
-    }
     return EffectPreset(
-        name = "MLBB Cinematic Kill",
-        videoPreset = selectedPreset,
-        intensity = intensity,
-        slowMotionSpeed = 0.25f,
+        name = "Classic",
+        videoPreset = VideoEffectPreset.KILL_IMPACT,
+        intensity = EffectIntensity.HIGH,
+        slowMotionSpeed = 1f,
         zoomAmount = 0f,
         shakeAmount = 1f
     )

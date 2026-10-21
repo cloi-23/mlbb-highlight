@@ -15,7 +15,6 @@ data class AppSettings(
     val enableScreenShake: Boolean = true,
     val enableSlowMotion: Boolean = true,
     val enableImpactFlash: Boolean = true,
-    val enableKillSound: Boolean = true,
     val enableBackgroundMusic: Boolean = false,
     val musicVolume: Float = 0.13f
 )

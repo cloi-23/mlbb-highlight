@@ -23,7 +23,7 @@ class AutoHighlightEngineTest {
         assertEquals(1, timeline.clips.size)
         val clip = timeline.clips.single()
         assertEquals(0L, clip.startMs)
-        assertEquals(7_500L, clip.endMs)
+        assertEquals(12_000L, clip.endMs)
         assertEquals(
             listOf(HighlightEventType.KILL, HighlightEventType.DOUBLE_KILL),
             clip.events.map(HighlightEvent::type)
@@ -47,9 +47,9 @@ class AutoHighlightEngineTest {
 
         assertEquals(2, timeline.clips.size)
         assertEquals(0L, timeline.clips.first().startMs)
-        assertEquals(2_500L, timeline.clips.first().endMs)
-        assertEquals(12_500L, timeline.clips.last().startMs)
-        assertEquals(16_500L, timeline.clips.last().endMs)
+        assertEquals(10_000L, timeline.clips.first().endMs)
+        assertEquals(10_000L, timeline.clips.last().startMs)
+        assertEquals(20_000L, timeline.clips.last().endMs)
         assertTrue(timeline.clips.all { it.startMs >= 0L && it.endMs <= 20_000L })
         assertTrue(timeline.clips.all { clip -> clip.speedCurve.points.all { it.speed == 1f } })
     }

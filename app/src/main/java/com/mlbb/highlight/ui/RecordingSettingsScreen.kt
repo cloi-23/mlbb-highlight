@@ -173,11 +173,6 @@ fun RecordingSettingsScreen(
                 onCheckedChange = { onSettingsChange(settings.copy(enableImpactFlash = it)) }
             )
             EffectToggleRow(
-                label = "Kill sound effect",
-                checked = settings.enableKillSound,
-                onCheckedChange = { onSettingsChange(settings.copy(enableKillSound = it)) }
-            )
-            EffectToggleRow(
                 label = "Background music",
                 checked = settings.enableBackgroundMusic,
                 onCheckedChange = { onSettingsChange(settings.copy(enableBackgroundMusic = it)) }

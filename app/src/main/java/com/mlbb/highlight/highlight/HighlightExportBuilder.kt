@@ -85,15 +85,22 @@ fun buildHighlightComposition(
                 }
             }
         }
+        val sourceAudioProcessors: List<androidx.media3.common.audio.AudioProcessor> =
+            if (timeline.gameAudioMuted || !timeline.preserveOriginalGameplay) {
+                listOf(GainProcessor(object : GainProcessor.GainProvider {
+                    override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float = 0f
+                    override fun isUnityUntil(samplePosition: Long, sampleRateHz: Int): Long = C.TIME_UNSET
+                }))
+            } else emptyList()
         val itemBuilder = EditedMediaItem.Builder(mediaItem)
-            .setEffects(Effects(emptyList(), videoEffects))
+            .setEffects(Effects(sourceAudioProcessors, videoEffects))
         if (
             active && settings.enableSlowMotion && timeline.enableSlowMotion &&
             clip.effectPreset.videoPreset == VideoEffectPreset.KILL_SLOWMO
         ) {
-            val windowStartUs = (eventTimeUs - 120_000L).coerceAtLeast(0L)
-            val windowEndUs = minOf(durationUs, eventTimeUs + 350_000L)
             val speed = clip.effectPreset.slowMotionSpeed.coerceIn(0.25f, 0.9f)
+            val windowStartUs = (eventTimeUs - (200_000f * speed).toLong()).coerceAtLeast(0L)
+            val windowEndUs = minOf(durationUs, eventTimeUs + (800_000f * speed).toLong())
             itemBuilder.setSpeed(object : SpeedProvider {
                 override fun getSpeed(timeUs: Long): Float =
                     if (timeUs in windowStartUs until windowEndUs) speed else 1f
@@ -108,104 +115,128 @@ fun buildHighlightComposition(
         videoItems.first(), *videoItems.drop(1).toTypedArray()
     ).build()
 
-    // Original audio remains attached to each selected moment; optional music loops under the montage.
+    // Original gameplay audio remains attached to each selected moment; optional music loops underneath.
     val sequences = mutableListOf(videoSequence)
-    val killSoundEnabled = timeline.enableKillSound
-    val killSoundUri = "android.resource://${context?.packageName ?: "com.mlbb.highlight"}/raw/default_kill_sound"
-    val killSoundDurationMs = if (killSoundEnabled && context != null) {
-        runCatching {
-            MediaMetadataRetriever().run {
-                setDataSource(context, Uri.parse(killSoundUri))
-                extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
-                    ?.also { release() }
-                    ?: run { release(); DEFAULT_KILL_SOUND_DURATION_MS }
-            }
-        }.getOrDefault(DEFAULT_KILL_SOUND_DURATION_MS)
-    } else DEFAULT_KILL_SOUND_DURATION_MS
-    if (killSoundEnabled && context != null) {
-        var outputOffsetMs = 0L
-        val cues = clips.flatMap { (clip, range) ->
-            val clipCues = clip.events.mapNotNull { event ->
-                val adjustedEventMs = event.sourceTimeMs - trimStartMs +
-                    (clip.eventTimeMs - clip.detectedEventTimeMs)
-                val inClipMs = adjustedEventMs - range.first
-                if (inClipMs in 0 until (clip.endMs - clip.startMs)) {
-                    outputOffsetMs + inClipMs
-                } else null
-            }
-            outputOffsetMs += range.second - range.first
-            clipCues
-        }.sorted()
-        val audioItems = mutableListOf<EditedMediaItem>()
-        var cursorMs = 0L
-        cues.forEach { cueMs ->
-            val cue = cueMs.coerceAtLeast(cursorMs)
-            var silenceMs = cue - cursorMs
-            while (silenceMs > 0L) {
-                val chunkMs = silenceMs.coerceAtMost(SILENCE_RESOURCE_DURATION_MS)
-                val silence = MediaItem.Builder()
-                    .setUri(Uri.parse("android.resource://${context.packageName}/raw/silence_60s"))
-                    .setClippingConfiguration(
-                        MediaItem.ClippingConfiguration.Builder()
-                            .setStartPositionMs(0L)
-                            .setEndPositionMs(chunkMs)
-                            .build()
-                    )
-                    .build()
-                audioItems += EditedMediaItem.Builder(silence).setRemoveVideo(true).build()
-                silenceMs -= chunkMs
-            }
+    val musicUri = timeline.musicUri
+    // Original gameplay audio remains attached to the video sequence. Music
+    // occupies its own timed sequence.
+    val bgMusicEnabled = !timeline.musicMuted && (settings.enableBackgroundMusic || musicUri != null)
+    if (bgMusicEnabled && musicUri != null) {
+        val effectiveVolume = timeline.musicVolume.coerceIn(0f, 1f)
+        val montageDurationMs = timeline.durationMs
+        val musicStartMs = timeline.musicStartMs.coerceIn(0L, montageDurationMs)
+        val musicEndMs = (timeline.musicEndMs ?: montageDurationMs)
+            .coerceIn(musicStartMs, montageDurationMs)
+        if (context == null && musicStartMs == 0L && musicEndMs == montageDurationMs &&
+            timeline.musicFadeInMs == 0L && timeline.musicFadeOutMs == 0L
+        ) {
+            // Keep the context-free composition path useful for callers that
+            // only inspect/build a looping sequence (such as unit tests).
+            val mediaItem = runCatching { MediaItem.fromUri(Uri.parse(musicUri)) }
+                .getOrElse { MediaItem.Builder().setMediaId(musicUri).build() }
             val gain = GainProcessor(object : GainProcessor.GainProvider {
-                override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float =
-                    timeline.killSoundVolume.coerceIn(0f, 1f)
-
+                override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float = effectiveVolume
                 override fun isUnityUntil(samplePosition: Long, sampleRateHz: Int): Long =
-                    if (timeline.killSoundVolume >= 1f) C.TIME_END_OF_SOURCE else C.TIME_UNSET
+                    if (effectiveVolume == 1f) C.TIME_END_OF_SOURCE else C.TIME_UNSET
             })
-            audioItems += EditedMediaItem.Builder(MediaItem.fromUri(Uri.parse(killSoundUri)))
+            val musicItem = EditedMediaItem.Builder(mediaItem)
                 .setRemoveVideo(true)
                 .setEffects(Effects(listOf(gain), emptyList()))
                 .build()
-            cursorMs = cue + killSoundDurationMs
-        }
-        if (audioItems.isNotEmpty()) {
-            sequences += EditedMediaItemSequence.Builder(
-                audioItems.first(), *audioItems.drop(1).toTypedArray()
-            ).build()
-        }
-    }
-    val musicUri = timeline.musicUri
-    // The kill cue takes priority over the optional backing track to keep the
-    // moment sound clear. Original gameplay audio remains in the video sequence.
-    val bgMusicEnabled = !killSoundEnabled && (settings.enableBackgroundMusic || musicUri != null)
-    if (bgMusicEnabled && musicUri != null) {
-        val configuredVolume = if (settings.musicVolume > 0f) settings.musicVolume else timeline.musicVolume
-        val effectiveVolume = configuredVolume.coerceIn(0f, 1f)
-        val gain = GainProcessor(object : GainProcessor.GainProvider {
-            override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float =
-                effectiveVolume
+            sequences += EditedMediaItemSequence.Builder(musicItem).setIsLooping(true).build()
+        } else if (musicEndMs > musicStartMs) {
+            val mediaUri = Uri.parse(musicUri)
+            val sourceDurationMs = context?.let { appContext ->
+                runCatching {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(appContext, mediaUri)
+                        retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                            ?.toLongOrNull() ?: 0L
+                    } finally {
+                        retriever.release()
+                    }
+                }.getOrDefault(0L)
+            } ?: 0L
+            require(sourceDurationMs > 0L) { "Could not read the selected music duration" }
+            val musicItems = mutableListOf<EditedMediaItem>()
+            fun appendSilence(durationMs: Long) {
+                var remainingMs = durationMs.coerceAtLeast(0L)
+                while (remainingMs > 0L) {
+                    val chunkMs = remainingMs.coerceAtMost(SILENCE_RESOURCE_DURATION_MS)
+                    val silence = MediaItem.Builder()
+                        .setUri(Uri.parse("android.resource://${context?.packageName ?: "com.mlbb.highlight"}/raw/silence_60s"))
+                        .setClippingConfiguration(
+                            MediaItem.ClippingConfiguration.Builder()
+                                .setStartPositionMs(0L)
+                                .setEndPositionMs(chunkMs)
+                                .build()
+                        )
+                        .build()
+                    musicItems += EditedMediaItem.Builder(silence).setRemoveVideo(true).build()
+                    remainingMs -= chunkMs
+                }
+            }
+            appendSilence(musicStartMs)
+            var outputCursorMs = musicStartMs
+            var sourceCursorMs = 0L
+            val knownSourceDurationMs = sourceDurationMs.takeIf { it > 0L }
+            while (outputCursorMs < musicEndMs) {
+                val remainingMs = musicEndMs - outputCursorMs
+                val chunkMs = knownSourceDurationMs?.let { minOf(it - sourceCursorMs, remainingMs) }
+                    ?: remainingMs
+                if (chunkMs <= 0L) {
+                    sourceCursorMs = 0L
+                    continue
+                }
+                val mediaBuilder = MediaItem.Builder().setUri(mediaUri)
+                if (knownSourceDurationMs != null) {
+                    mediaBuilder.setClippingConfiguration(
+                        MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(sourceCursorMs)
+                            .setEndPositionMs(sourceCursorMs + chunkMs)
+                            .build()
+                    )
+                }
+                val fadeInMs = timeline.musicFadeInMs.coerceAtMost(musicEndMs - musicStartMs)
+                val fadeOutMs = timeline.musicFadeOutMs.coerceAtMost(musicEndMs - musicStartMs)
+                val segmentStartMs = outputCursorMs
+                val gain = GainProcessor(object : GainProcessor.GainProvider {
+                    override fun getGainFactorAtSamplePosition(samplePosition: Long, sampleRateHz: Int): Float {
+                        val timeMs = segmentStartMs + samplePosition * 1_000L / sampleRateHz
+                        val inGain = if (fadeInMs > 0L) {
+                            ((timeMs - musicStartMs).toFloat() / fadeInMs).coerceIn(0f, 1f)
+                        } else 1f
+                        val outGain = if (fadeOutMs > 0L) {
+                            ((musicEndMs - timeMs).toFloat() / fadeOutMs).coerceIn(0f, 1f)
+                        } else 1f
+                        return effectiveVolume * minOf(inGain, outGain)
+                    }
 
-            override fun isUnityUntil(samplePosition: Long, sampleRateHz: Int): Long =
-                if (effectiveVolume == 1f) C.TIME_END_OF_SOURCE else C.TIME_UNSET
-        })
-        val musicMediaItem = try {
-            MediaItem.fromUri(Uri.parse(musicUri))
-        } catch (_: Throwable) {
-            MediaItem.Builder().setMediaId(musicUri).build()
+                    override fun isUnityUntil(samplePosition: Long, sampleRateHz: Int): Long =
+                        if (effectiveVolume == 1f && fadeInMs == 0L && fadeOutMs == 0L) {
+                            C.TIME_END_OF_SOURCE
+                        } else C.TIME_UNSET
+                })
+                musicItems += EditedMediaItem.Builder(mediaBuilder.build())
+                    .setRemoveVideo(true)
+                    .setEffects(Effects(listOf(gain), emptyList()))
+                    .build()
+                outputCursorMs += chunkMs
+                if (knownSourceDurationMs != null) sourceCursorMs += chunkMs
+            }
+            appendSilence(montageDurationMs - musicEndMs)
+            if (musicItems.isNotEmpty()) {
+                sequences += EditedMediaItemSequence.Builder(
+                    musicItems.first(), *musicItems.drop(1).toTypedArray()
+                ).build()
+            }
         }
-        val musicItem = EditedMediaItem.Builder(musicMediaItem)
-            .setRemoveVideo(true)
-            .setEffects(Effects(listOf(gain), emptyList()))
-            .build()
-        sequences += EditedMediaItemSequence.Builder(musicItem)
-            .setIsLooping(true)
-            .build()
     }
 
     return Composition.Builder(sequences).build()
 }
 
-private const val DEFAULT_KILL_SOUND_DURATION_MS = 1_000L
 private const val SILENCE_RESOURCE_DURATION_MS = 60_000L
 
 data class HighlightValidationResult(
@@ -262,19 +293,22 @@ fun buildHighlightSpeedProvider(
 ): SpeedProvider? {
     val activeClips = timeline.clips.filter {
         it.effectPreset.intensity != EffectIntensity.OFF &&
-            it.effectPreset.videoPreset != VideoEffectPreset.NONE
+            it.effectPreset.videoPreset == VideoEffectPreset.KILL_SLOWMO
     }
     if (activeClips.isEmpty() || !timeline.enableSlowMotion) return null
     val windows = activeClips.map { clip ->
         val eventTime = clip.eventTimeMs + timeOffsetMs
-        val sUs = (eventTime - 120L).coerceAtLeast(0L) * 1_000L
-        val eUs = (eventTime + 350L) * 1_000L
-        sUs to eUs
+        val speed = clip.effectPreset.slowMotionSpeed.coerceIn(0.25f, 0.9f)
+        val beforeMs = (200f * speed).toLong()
+        val afterMs = (800f * speed).toLong()
+        val startUs = (eventTime - beforeMs).coerceAtLeast(0L) * 1_000L
+        val endUs = (eventTime + afterMs) * 1_000L
+        Triple(startUs, endUs, speed)
     }
     return object : SpeedProvider {
         override fun getSpeed(timeUs: Long): Float {
-            val inSlow = windows.any { (s, e) -> timeUs in s until e }
-            return if (inSlow) 0.55f else 1f
+            return windows.firstOrNull { (startUs, endUs, _) -> timeUs in startUs until endUs }
+                ?.third ?: 1f
         }
 
         override fun getNextSpeedChangeTimeUs(timeUs: Long): Long {
